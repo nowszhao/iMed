@@ -1,0 +1,19 @@
+{
+  "name": "shiguang-photo-organizer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "vite frontend --host 127.0.0.1",
+    "build": "tauri build",
+    "frontend:build": "vite build frontend --outDir ../dist --emptyOutDir"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.4",
+    "vite": "^7.1.0"
+  }
+}

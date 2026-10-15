@@ -1,0 +1,28 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="shell" x1="15" y1="12" x2="112" y2="119" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#38463A"/>
+      <stop offset="1" stop-color="#263329"/>
+    </linearGradient>
+    <linearGradient id="lens" x1="44" y1="41" x2="82" y2="86" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#DDEAD7"/>
+      <stop offset="1" stop-color="#9FB99B"/>
+    </linearGradient>
+    <filter id="glow" x="41" y="31" width="48" height="49" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="5"/>
+    </filter>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="32" fill="url(#shell)"/>
+  <rect x="4.75" y="4.75" width="118.5" height="118.5" rx="31.25" stroke="white" stroke-opacity=".12" stroke-width="1.5"/>
+
+  <!-- Four finder corners suggest scanning without making the mark feel like a camera button. -->
+  <path d="M43 34H36C32.686 34 30 36.686 30 40V47" stroke="#F0F2E9" stroke-width="5" stroke-linecap="round"/>
+  <path d="M85 34H92C95.314 34 98 36.686 98 40V47" stroke="#F0F2E9" stroke-width="5" stroke-linecap="round"/>
+  <path d="M30 81V88C30 91.314 32.686 94 36 94H43" stroke="#F0F2E9" stroke-width="5" stroke-linecap="round"/>
+  <path d="M98 81V88C98 91.314 95.314 94 92 94H85" stroke="#F0F2E9" stroke-width="5" stroke-linecap="round"/>
+
+  <circle cx="64" cy="63" r="15" fill="#B5D1AE" opacity=".35" filter="url(#glow)"/>
+  <path d="M64 44.5L68.65 57.35L81.5 62L68.65 66.65L64 79.5L59.35 66.65L46.5 62L59.35 57.35L64 44.5Z" fill="url(#lens)"/>
+  <path d="M88 78L90.3 84.1L96.5 86.4L90.3 88.7L88 94.8L85.7 88.7L79.5 86.4L85.7 84.1L88 78Z" fill="#B7D4AE"/>
+  <circle cx="45" cy="79" r="2.2" fill="#E9F0E4" fill-opacity=".78"/>
+</svg>

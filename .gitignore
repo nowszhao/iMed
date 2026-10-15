@@ -1,0 +1,22 @@
+# JavaScript dependencies and build output
+node_modules/
+dist/
+
+# Rust build artifacts
+/target/
+/src-tauri/target/
+
+# SwiftPM build artifacts
+/native/PhotoBridge/.build/
+
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Local environment and editor state
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
