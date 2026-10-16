@@ -3,15 +3,15 @@ import { bindSearchInput } from './search-input.js';
 
 const $ = (selector) => document.querySelector(selector);
 const state = {
-  assets: [], rules: [], counts: { photos: 0, usb: 0, queued: 0, candidates: 0 },
+  assets: [], rules: [], counts: { photos: 0, usb: 0, photosVideos: 0, usbVideos: 0, unsupported: 0, queued: 0, candidates: 0, indexed: 0, unindexed: 0, failed: 0 },
   reviewCounts: { pending: 0, later: 0 },
-  page: 'cleanup', ruleId: 'blur', source: 'all', tab: 'all', query: '', includeWeak: false, searchPending: false, searchError: '',
+  page: 'all', ruleId: 'blur', source: 'all', tab: 'all', query: '', includeWeak: false, searchPending: false, searchError: '', mediaType: 'all', indexStatus: 'all', setupStep: 0, modelState: 'not_loaded', modelProgress: { state: 'not_loaded', file: '', downloadedBytes: 0, totalBytes: 0 },
   selected: new Set(), focus: null, offset: 0, photoOffset: 0, usbOffset: 0, limit: 60, total: 0, sortAsc: false, inspectorHidden: false,
-  photoStatus: 'unknown', usbStatus: 'unknown', photoTotal: 0, usbViewTotal: 0, similarAnchor: null, searchGeneration: 0, scanTimer: null, indexTimer: null, indexRequest: 0, originalRequest: 0, toastTimer: null,
+  photoStatus: 'unknown', usbStatus: 'unknown', photoTotal: 0, usbViewTotal: 0, similarAnchor: null, searchGeneration: 0, scanTimer: null, indexTimer: null, indexRequest: 0, originalRequest: 0, toastTimer: null, syncTimer: null, setupSyncedSources: new Set(), setupIndexRun: false, syncProgress: null, indexProgress: null,
 };
 const labels = {
   all: ['所有照片', '图库'], recent: ['最近导入', '图库'], favorites: ['收藏', '图库'],
-  search: ['语义搜索', '整理'], cleanup: ['清理建议', '整理'], similar: ['相似照片', '整理'], queue: ['待删除', '整理'],
+  indexing: ['构建索引', '图库'], search: ['语义搜索', '整理'], cleanup: ['清理建议', '整理'], similar: ['相似照片', '整理'], queue: ['待删除', '整理'],
 };
 const svgImage = '<svg viewBox="0 0 20 20" fill="none"><rect x="3" y="3.5" width="14" height="13" rx="2" stroke="currentColor" stroke-width="1.2"/><circle cx="7" cy="8" r="1.3" fill="currentColor"/><path d="m4.5 14 3.5-3.3 2.2 2 2-1.7 3.3 3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 const checkSvg = '<svg viewBox="0 0 16 16" fill="none"><path d="m3.3 8.2 3 3L12.8 4.8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -19,6 +19,239 @@ const checkSvg = '<svg viewBox="0 0 16 16" fill="none"><path d="m3.3 8.2 3 3L12.
 function toast(message) {
   const node = $('#toast'); node.textContent = message; node.classList.add('show');
   clearTimeout(state.toastTimer); state.toastTimer = setTimeout(() => node.classList.remove('show'), 2400);
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = bytes, unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+  return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function setupStatus(message, indeterminate = false, percent = null, detail = '') {
+  const node = $('#setupStatus');
+  const width = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
+  const fillStyle = Number.isFinite(percent) ? ` style="width:${width}%"` : '';
+  node.innerHTML = `${escapeHtml(message)}${detail ? `<div class="setup-progress-detail">${escapeHtml(detail)}</div>` : ''}<div class="setup-progress ${indeterminate ? 'indeterminate' : ''}"><i${fillStyle}></i></div>`;
+}
+
+function renderSetup() {
+  const step = state.setupStep;
+  document.querySelectorAll('.setup-step').forEach((node, index) => {
+    node.classList.toggle('active', index === step);
+    node.classList.toggle('done', index < step);
+  });
+  $('#setupTitle').textContent = ['准备本地图片模型', '连接照片来源', '选择图片索引范围'][step];
+  $('#setupDescription').textContent = [
+    '模型在本机运行，用于图片向量化和语义搜索。首次准备需要下载模型文件，请保持网络连接。',
+    '选择要同步的照片来源。同步只读取媒体信息；Mac 照片图库需要授权，iPhone 需要通过 USB 连接并解锁。',
+    '选择拍摄日期范围，为照片建立本地索引。也可以先跳过，稍后从首页进入构建索引。',
+  ][step];
+  $('#setupSourceChoices').classList.toggle('is-hidden', step !== 1);
+  $('#setupIndexChoices').classList.toggle('is-hidden', step !== 2);
+  $('#setupBack').classList.toggle('is-hidden', step === 0);
+  $('#setupSkip').classList.toggle('is-hidden', step !== 2);
+  $('#setupNext').textContent = step === 0 ? (state.modelState === 'ready' ? '继续' : state.modelState === 'error' ? '重试准备' : '准备模型') : step === 1 ? '继续' : '建立索引';
+  $('#setupStopIndex').classList.toggle('is-hidden', !state.setupIndexRun || !state.indexProgress?.running);
+  const chosenSources = setupChosenSources();
+  $('#setupNext').disabled = step === 0
+    ? ['checking','loading','downloading','warming'].includes(state.modelState)
+    : step === 1
+      ? !chosenSources.length || chosenSources.some(source => !state.setupSyncedSources.has(source))
+      : false;
+  $('#setupNext').classList.toggle('is-hidden', step === 1);
+}
+
+async function pollModelSetup() {
+  try {
+    state.modelProgress = await invoke('model_progress');
+    state.modelState = state.modelProgress.state;
+    updateHeader();
+    if (state.setupStep === 0) {
+      const progress = state.modelProgress;
+      const labels = {
+        not_loaded: '本地模型尚未准备，点击“准备模型”开始。',
+        checking: '正在检查模型存储位置…',
+        loading: '模型文件已下载，正在将权重加载到本机…',
+        downloading: progress.file
+          ? `正在下载 EmbeddingGemma 2：${progress.file.split('/').pop()}`
+          : '正在连接模型仓库并检查模型文件…',
+        warming: '模型文件已就绪，正在本机预热…',
+        ready: '模型准备完成，可以继续连接照片来源。',
+        error: '模型准备失败，请检查网络后重试。',
+      };
+      const downloading = state.modelState === 'downloading';
+      const percent = downloading && progress.totalBytes > 0
+        ? Math.floor(progress.downloadedBytes / progress.totalBytes * 100)
+        : null;
+      const detail = downloading && progress.totalBytes > 0
+        ? `当前文件 ${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)} · ${percent}%`
+        : '';
+      setupStatus(labels[state.modelState] || '正在检查模型…', ['checking','loading','warming'].includes(state.modelState) || (downloading && percent === null), percent, detail);
+      renderSetup();
+      $('#setupNext').disabled = ['checking','loading','downloading','warming'].includes(state.modelState);
+    }
+  } catch (error) { setupStatus(`检查模型状态失败：${error}`); }
+}
+
+async function beginModelPreparation() {
+  if (['checking','loading','downloading','warming'].includes(state.modelState)) return;
+  state.modelState = 'checking';
+  state.modelProgress = { state: 'checking', file: '', downloadedBytes: 0, totalBytes: 0 };
+  setupStatus('正在检查模型存储位置…', true);
+  renderSetup(); updateHeader();
+  void invoke('prepare_model').then(async () => {
+    await pollModelSetup();
+  }).catch(async error => {
+    await pollModelSetup();
+    if (state.modelState !== 'ready') {
+      state.modelState = 'error';
+      setupStatus(`模型准备失败：${error}`);
+      renderSetup(); updateHeader();
+    }
+  });
+}
+
+function openSetup() {
+  $('#setupBackdrop').classList.add('open');
+  void pollModelSetup();
+  renderSetup();
+}
+
+function finishSetup() {
+  try { localStorage.setItem('shiguangSetupV2Complete', 'true'); } catch { /* Tauri app storage can be unavailable in restricted webviews. */ }
+  $('#setupBackdrop').classList.remove('open');
+  state.page = 'all';
+  state.indexStatus = 'all';
+  $('#indexStatusFilter').value = 'all';
+  renderGrid();
+  void reloadCurrent();
+}
+
+function openIndexPage() {
+  cancelSearchInput();
+  state.page = 'indexing';
+  state.selected.clear();
+  renderGrid();
+  $('#indexPage').classList.add('active');
+  if (!$('#indexStartDate').value) defaultIndexDates();
+}
+
+function setupNext() {
+  if (state.setupStep === 0) {
+    if (state.modelState === 'ready') {
+      state.setupStep = 1;
+      setupStatus('模型准备完成，可以连接照片来源。');
+      renderSetup();
+      return;
+    }
+    void beginModelPreparation();
+    return;
+  }
+  if (state.setupStep === 1) {
+    const sources = setupChosenSources();
+    if (!sources.length || sources.some(source => !state.setupSyncedSources.has(source))) {
+      $('#setupSyncStatus').textContent = '请先授权并同步至少一个照片来源。';
+      return;
+    }
+    state.setupStep = 2;
+    setupStatus('照片来源已同步，可以选择索引范围。');
+    renderSetup();
+    return;
+  }
+  startIndexing(true);
+}
+
+function setupBack() {
+  if (state.setupStep > 0) state.setupStep--;
+  renderSetup();
+}
+
+function setupIndexDates() {
+  const start = $('#setupStartDate').value;
+  const end = $('#setupEndDate').value;
+  if (start) $('#indexStartDate').value = start;
+  if (end) $('#indexEndDate').value = end;
+  $('#indexSource').value = $('#setupIndexSource').value;
+}
+
+function setupChosenSources() {
+  return [...document.querySelectorAll('#setupSourceChoices input:checked')].map(input => input.value);
+}
+
+function setupChosenIndexSource() {
+  return $('#setupIndexSource').value || 'all';
+}
+
+function setupChosenSource() {
+  const chosen = setupChosenSources();
+  if (chosen.includes('photos') && chosen.includes('usb')) return 'all';
+  return chosen[0] || '';
+}
+
+function updateSetupIndexSources() {
+  const selected = [...state.setupSyncedSources];
+  const select = $('#setupIndexSource');
+  const options = selected.length > 1
+    ? [['all', '所有已同步来源'], ...selected.map(source => [source, source === 'usb' ? 'USB iPhone' : 'Mac 照片图库'])]
+    : selected.map(source => [source, source === 'usb' ? 'USB iPhone' : 'Mac 照片图库']);
+  const previous = select.value;
+  select.replaceChildren(...options.map(([value, label]) => {
+    const option = document.createElement('option'); option.value = value; option.textContent = label; return option;
+  }));
+  select.value = options.some(([value]) => value === previous) ? previous : options[0]?.[0] || 'all';
+}
+
+async function syncSetupSources() {
+  const sources = setupChosenSources();
+  const source = setupChosenSource();
+  if (!sources.length) { $('#setupSyncStatus').textContent = '请至少选择一个照片来源。'; return; }
+  state.setupSyncedSources.clear();
+  document.querySelectorAll('#setupSourceChoices input').forEach(input => { input.disabled = true; });
+  renderSetup();
+  $('#setupSyncSources').disabled = true;
+  $('#setupSyncStatus').textContent = '正在同步来源媒体信息…';
+  clearInterval(state.syncTimer);
+  state.syncTimer = setInterval(async () => {
+    try {
+      const progress = await invoke('sync_progress');
+      updateSyncStatus(progress);
+    } catch { /* 保留当前进度文案。 */ }
+  }, 500);
+  try {
+    const result = await invoke('library_sync', { source });
+    await syncAll();
+    state.setupSyncedSources = new Set(sources);
+    updateSetupIndexSources();
+    $('#setupSyncStatus').textContent = `同步完成，共 ${result.synced || 0} 项媒体。`;
+    state.setupStep = 2;
+    state.source = source;
+    $('#sourceSelect').value = source;
+    setupStatus('照片来源同步完成，可以选择索引范围。');
+    renderSetup();
+  } catch (error) {
+    $('#setupSyncStatus').textContent = `同步未完成：${error}`;
+  } finally {
+    clearInterval(state.syncTimer); state.syncTimer = null;
+    document.querySelectorAll('#setupSourceChoices input').forEach(input => { input.disabled = false; });
+    $('#setupSyncSources').disabled = false;
+  }
+}
+
+async function authorizeSetupPhotos() {
+  try {
+    await invoke('photos_authorize');
+    $('#setupSyncStatus').textContent = '已请求系统授权。请在 macOS 对话框中允许访问，再点击“同步所选来源”。';
+    for (let attempt = 0; attempt < 60; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      const value = await invoke('photos_status');
+      state.photoStatus = value.status || state.photoStatus;
+      if (['authorized','limited','denied','restricted'].includes(state.photoStatus)) break;
+    }
+    updateHeader();
+    renderSetup();
+  } catch (error) { $('#setupSyncStatus').textContent = `授权状态读取失败：${error}`; }
 }
 
 function escapeHtml(value = '') {
@@ -58,6 +291,46 @@ function updateHeader() {
   $('#queueSideCount').textContent = state.counts.queued || 0;
   $('#queueCount').textContent = `${state.counts.queued || 0} →`;
   $('#candidateCount').textContent = state.counts.candidates || 0;
+  const modelPercent = state.modelProgress.totalBytes > 0
+    ? Math.floor(state.modelProgress.downloadedBytes / state.modelProgress.totalBytes * 100)
+    : 0;
+  $('#environmentModel').textContent = state.modelState === 'downloading'
+    ? `下载 ${modelPercent}% · ${state.modelProgress.file.split('/').pop() || '模型文件'}`
+    : ({not_loaded:'尚未准备',checking:'正在检查模型…',loading:'正在加载模型…',warming:'模型预热中…',ready:'模型已就绪',error:'模型准备失败'})[state.modelState] || '正在检查…';
+  const synced = [];
+  if (state.counts.photosFullySynced && (state.photoStatus === 'authorized' || state.photoStatus === 'limited')) synced.push(`照片图库 ${state.counts.photos || 0} 项`);
+  else if (state.photoStatus === 'authorized' || state.photoStatus === 'limited') synced.push('照片图库待同步');
+  if (state.counts.usbFullySynced && state.usbStatus === 'connected') synced.push(`iPhone ${state.counts.usb || 0} 项`);
+  else if (state.usbStatus === 'connected') synced.push('iPhone 待同步');
+  $('#environmentSource').textContent = synced.join(' · ') || '尚未连接照片来源';
+  $('#environmentIndex').textContent = `${state.counts.indexed || 0} 已索引 · ${state.counts.unindexed || 0} 未索引${state.counts.failed ? ` · ${state.counts.failed} 失败` : ''}`;
+  $('#indexStatIndexed').textContent = state.counts.indexed || 0;
+  $('#indexStatPending').textContent = state.counts.unindexed || 0;
+  $('#indexStatFailed').textContent = state.counts.failed || 0;
+  $('#environmentIndexBtn').textContent = state.counts.unindexed ? '继续构建索引' : '管理索引';
+  if (state.setupStep === 1) renderSetup();
+}
+
+function updateSyncStatus(progress) {
+  state.syncProgress = progress;
+  if (progress.running) {
+    const count = progress.total ? ` ${progress.completed} / ${progress.total}` : '';
+    $('#setupSyncStatus').textContent = `${progress.message || '正在同步照片来源…'}${count}`;
+    $('#environmentSource').textContent = progress.message || '正在同步照片来源…';
+  }
+}
+
+async function pollSyncProgress() {
+  try {
+    const progress = await invoke('sync_progress');
+    updateSyncStatus(progress);
+    if (!progress.running) {
+      clearInterval(state.syncTimer); state.syncTimer = null;
+      await reloadCounts();
+    }
+  } catch (error) {
+    $('#setupSyncStatus').textContent = `读取同步进度失败：${error}`;
+  }
 }
 
 function currentRule() { return state.rules.find(rule => rule.id === state.ruleId); }
@@ -87,6 +360,8 @@ function setSubheading() {
       : '选择一张已索引照片，在详情面板中查找向量相似照片。';
   } else if (state.page === 'all') {
     $('#subheading').innerHTML = `<strong>${state.total || 0} 张</strong>来自当前照片来源`;
+  } else if (state.page === 'indexing') {
+    $('#subheading').innerHTML = '选择日期范围，为照片建立本地向量索引。';
   } else if (state.page === 'search') {
     $('#subheading').innerHTML = state.query
       ? `搜索 <strong>“${escapeHtml(state.query)}”</strong> 的已索引照片 · ${state.includeWeak ? '包含较弱相关结果' : '仅显示相关性突出的结果'}`
@@ -105,6 +380,16 @@ function decoratePage() {
   $('#addSelected').textContent = state.page === 'queue' ? '移出待删除' : '加入待删除';
   $('#confirmSelected').classList.toggle('is-hidden', state.page !== 'queue');
   $('#weakResults').classList.toggle('is-hidden', state.page !== 'search');
+  $('#environmentBanner').classList.toggle('is-hidden', !['all','indexing'].includes(state.page));
+  $('#indexPage').classList.toggle('active', state.page === 'indexing');
+  $('#libraryFilters').classList.toggle('is-hidden', !['all','recent','favorites'].includes(state.page));
+  $('#mediaTypeFilter').value = state.mediaType;
+  $('#indexStatusFilter').value = state.indexStatus;
+  $('#indexStatusFilter').disabled = state.mediaType === 'video';
+  $('#indexStatusFilter').setAttribute('aria-label', state.mediaType === 'video' ? '视频索引状态：暂不支持索引' : '索引状态');
+  $('#photoGrid').classList.toggle('is-hidden', state.page === 'indexing');
+  $('#loadMore').parentElement.classList.toggle('is-hidden', state.page === 'indexing');
+  $('.selection-bar').classList.toggle('is-hidden', state.page === 'indexing');
   $('#weakResults').setAttribute('aria-pressed', String(state.includeWeak));
   $('#weakResults').textContent = state.includeWeak ? '仅看突出结果' : '包含较弱结果';
   setSubheading();
@@ -116,6 +401,8 @@ function decoratePage() {
 function filterAssets() {
   let rows = [...state.assets];
   if (state.source !== 'all') rows = rows.filter(asset => asset.source === state.source);
+  if (state.mediaType !== 'all') rows = rows.filter(asset => asset.media_type === state.mediaType);
+  if (state.mediaType === 'video' || state.indexStatus === 'unsupported') rows = rows.filter(asset => asset.media_type === 'video');
   if (state.page === 'cleanup') rows = rows.filter(asset => asset.rule_id === state.ruleId && asset.score !== null && asset.score !== undefined);
   if (state.page === 'queue') rows = rows.filter(asset => asset.queued);
   if (state.page === 'favorites') rows = rows.filter(asset => asset.favorite);
@@ -291,21 +578,26 @@ function renderGrid() {
         : '';
       const dimensions = asset.width && asset.height ? `${asset.width} × ${asset.height}` : sourceName(asset.source);
       const thumb = thumbnailMarkup(asset);
-      return `<article class="photo-card ${selected ? 'selected' : ''}" data-id="${escapeHtml(key)}" tabindex="0" aria-label="${escapeHtml(asset.name)}"><div class="image-wrap">${thumb}<span class="check">${checkSvg}</span>${score ? `<span class="match-pill">${score}</span>` : ''}</div><div class="photo-meta"><span class="photo-date">${escapeHtml(formatDate(asset.date))}</span><span class="photo-size">${escapeHtml(dimensions)}</span></div><div class="photo-reason">${escapeHtml(asset.name)} · ${escapeHtml(sourceName(asset.source))}${asset.queued ? ' · 待删除' : ''}</div></article>`;
+      const indexState = asset.index_status || (asset.media_type === 'video' ? 'unsupported' : 'pending');
+      const indexLabel = indexState === 'indexed' ? '已索引' : indexState === 'failed' ? '索引失败' : indexState === 'unsupported' ? '暂不支持索引' : '未索引';
+      const mediaVisual = asset.media_type === 'video' ? '<div class="video-placeholder"><span>▶</span><small>视频 · 暂不支持向量索引</small></div>' : thumb;
+      return `<article class="photo-card ${selected ? 'selected' : ''}" data-id="${escapeHtml(key)}" tabindex="0" aria-label="${escapeHtml(asset.name)}"><div class="image-wrap">${mediaVisual}<span class="check">${checkSvg}</span>${score ? `<span class="match-pill">${score}</span>` : ''}${['all','recent','favorites'].includes(state.page) ? `<span class="index-badge ${indexState}">${indexLabel}</span>` : ''}</div><div class="photo-meta"><span class="photo-date">${escapeHtml(formatDate(asset.date))}</span><span class="photo-size">${escapeHtml(dimensions)}</span></div><div class="photo-reason">${escapeHtml(asset.name)} · ${escapeHtml(sourceName(asset.source))}${asset.queued ? ' · 待删除' : ''}</div></article>`;
     }).join('');
   }
+  // The library page appends per source, so its cursor is the pair of source
+  // offsets rather than the shared page offset.
+  const libraryLoaded = state.photoOffset + state.usbOffset;
   const canLoadMore = state.page === 'all'
-    ? (state.source === 'usb'
-      ? state.usbOffset < state.usbViewTotal
-      : state.source === 'photos'
-        ? state.photoOffset < state.photoTotal
-        : state.photoOffset < state.photoTotal || state.usbOffset < state.usbViewTotal)
-    : ['cleanup', 'queue'].includes(state.page) && state.offset + state.limit < state.total;
+    ? libraryLoaded < state.total
+    : ['recent', 'favorites'].includes(state.page)
+      ? state.offset + state.limit < state.total
+      : ['cleanup', 'queue'].includes(state.page) && state.offset + state.limit < state.total;
   $('#loadMore').parentElement.style.display = canLoadMore ? 'flex' : 'none';
   const loadedCount = state.page === 'all'
-    ? state.source === 'all' ? state.photoOffset + state.usbOffset
-      : state.source === 'usb' ? state.usbOffset : state.photoOffset
-    : Math.min(state.offset + state.limit, state.total);
+    ? Math.min(libraryLoaded, state.total)
+    : ['recent', 'favorites'].includes(state.page)
+      ? Math.min(state.offset + items.length, state.total)
+      : Math.min(state.offset + state.limit, state.total);
   $('#loadMore').textContent = `加载更多（${loadedCount} / ${state.total}）　↓`;
   updateSortButton();
   decoratePage();
@@ -323,18 +615,26 @@ function renderInspector(asset) {
     $('#inspectorBody').innerHTML = `<div class="empty-state" style="padding:54px 12px"><div class="empty-icon">${svgImage}</div>选择一张照片查看信息</div>`;
     return;
   }
-  const thumb = thumbnailMarkup(asset);
+  const isVideo = asset.media_type === 'video';
+  const thumb = isVideo
+    ? '<div class="video-placeholder inspector-video"><span>▶</span><small>视频 · 暂不支持预览和向量索引</small></div>'
+    : thumbnailMarkup(asset);
   const rule = state.rules.find(item => item.id === asset.rule_id);
   const score = Number.isFinite(asset.score) ? asset.score : null;
   const similarity = state.page === 'similar' ? state.similarAnchor : null;
   const semanticSearch = state.page === 'search';
-  const matchTitle = similarity ? `与「${similarity.name}」相似` : semanticSearch ? '语义搜索结果' : rule?.name || '尚未匹配扫描规则';
-  const matchReason = similarity
+  const matchTitle = isVideo ? '视频索引状态' : similarity ? `与「${similarity.name}」相似` : semanticSearch ? '语义搜索结果' : rule?.name || '尚未匹配扫描规则';
+  const matchReason = isVideo ? '当前版本保留视频媒体信息，暂不为视频生成图片向量。' : similarity
     ? '基于本地图片向量计算的相似度，仅比较已建立索引的照片。'
     : semanticSearch ? `与“${state.query}”的语义相关度，仅用于排序，不是识别概率。${asset.weakMatch ? '该结果未达到相关性突出门槛。' : ''}`
       : rule?.prompt || '完成规则扫描后，会显示这张照片与描述的匹配分数。';
   const scoreTitle = similarity ? '向量相似度' : semanticSearch ? '语义相关度' : '语义匹配分数';
-  $('#inspectorBody').innerHTML = `<div class="preview-wrap">${thumb}</div><div class="image-caption"><strong>${escapeHtml(formatDate(asset.date))}</strong><span>${escapeHtml(sourceName(asset.source))}</span></div><button class="view-original" id="viewOriginal">查看高清原图</button><div class="detail-title">${similarity ? '相似度结果' : rule || semanticSearch ? '匹配结果' : '照片信息'}</div><div class="rule-hit"><div class="hit-top"><i class="hit-badge"></i>${escapeHtml(matchTitle)}<span class="hit-score">${score === null ? '未扫描' : `${Math.round(score * 100)}%`}</span></div><div class="hit-reason">${escapeHtml(matchReason)}</div></div>${score === null ? '' : `<div class="score-label"><span>${scoreTitle}</span><strong>${score.toFixed(3)}</strong></div><div class="score-track"><i style="width:${Math.max(0, Math.min(100, score * 100))}%"></i></div>`}<div class="metadata"><span>文件名称</span><strong title="${escapeHtml(asset.name)}">${escapeHtml(asset.name)}</strong><span>拍摄时间</span><strong>${escapeHtml(formatDate(asset.date))}</strong><span>分辨率</span><strong>${asset.width && asset.height ? `${asset.width} × ${asset.height}` : '未知'}</strong><span>来源</span><strong>${escapeHtml(sourceName(asset.source))}</strong><span>审核状态</span><strong>${asset.queued ? '待删除' : asset.reviewed === 'kept' ? '已保留' : asset.reviewed === 'later' ? '稍后复核' : '待复核'}</strong></div><div class="inspector-actions"><button class="keep-btn" id="keepOne">✓　保留</button><button class="later-btn" id="laterOne">稍后复核</button></div><button class="similar-action" id="findSimilar">⌕　查找相似照片</button>`;
+  const matchDetails = isVideo
+    ? `<div class="detail-title">视频信息</div><div class="hit-reason">${escapeHtml(matchReason)}</div>`
+    : `<div class="detail-title">${similarity ? '相似度结果' : rule || semanticSearch ? '匹配结果' : '照片信息'}</div><div class="rule-hit"><div class="hit-top"><i class="hit-badge"></i>${escapeHtml(matchTitle)}<span class="hit-score">${score === null ? '未扫描' : `${Math.round(score * 100)}%`}</span></div><div class="hit-reason">${escapeHtml(matchReason)}</div></div>${score === null ? '' : `<div class="score-label"><span>${scoreTitle}</span><strong>${score.toFixed(3)}</strong></div><div class="score-track"><i style="width:${Math.max(0, Math.min(100, score * 100))}%"></i></div>`}`;
+  const photoActions = isVideo ? '' : `<button class="view-original" id="viewOriginal">查看高清原图</button><div class="inspector-actions"><button class="keep-btn" id="keepOne">✓　保留</button><button class="later-btn" id="laterOne">稍后复核</button></div><button class="similar-action" id="findSimilar">⌕　查找相似照片</button>`;
+  $('#inspectorBody').innerHTML = `<div class="preview-wrap">${thumb}</div><div class="image-caption"><strong>${escapeHtml(formatDate(asset.date))}</strong><span>${escapeHtml(sourceName(asset.source))}</span></div>${photoActions}${matchDetails}<div class="metadata"><span>文件名称</span><strong title="${escapeHtml(asset.name)}">${escapeHtml(asset.name)}</strong><span>拍摄时间</span><strong>${escapeHtml(formatDate(asset.date))}</strong><span>分辨率</span><strong>${asset.width && asset.height ? `${asset.width} × ${asset.height}` : '未知'}</strong><span>来源</span><strong>${escapeHtml(sourceName(asset.source))}</strong>${isVideo ? '<span>索引状态</span><strong>暂不支持索引</strong>' : `<span>审核状态</span><strong>${asset.queued ? '待删除' : asset.reviewed === 'kept' ? '已保留' : asset.reviewed === 'later' ? '稍后复核' : '待复核'}</strong>`}</div>`;
+  if (isVideo) return;
   $('#viewOriginal').onclick = () => openOriginalViewer(asset);
   $('#keepOne').onclick = () => review([asset], 'keep');
   $('#laterOne').onclick = () => review([asset], asset.reviewed === 'later' ? 'pending' : 'later');
@@ -374,9 +674,13 @@ function defaultIndexDates() {
   $('#indexStartDate').value = toInputDate(start);
   $('#indexEndDate').value = toInputDate(today);
   $('#indexSource').value = state.source;
+  if (!$('#setupStartDate').value) $('#setupStartDate').value = toInputDate(start);
+  if (!$('#setupEndDate').value) $('#setupEndDate').value = toInputDate(today);
 }
 
 function showIndexProgress(progress) {
+  state.indexProgress = progress;
+  renderSetup();
   const panel = $('#indexProgress');
   panel.classList.add('show');
   $('#indexProgressText').textContent = progress.message || '正在准备索引…';
@@ -384,6 +688,9 @@ function showIndexProgress(progress) {
   $('#indexProgressFill').style.width = `${percent}%`;
   $('#stopIndexBtn').disabled = !progress.running;
   $('#startIndexBtn').disabled = Boolean(progress.running);
+  $('#environmentIndex').textContent = progress.running
+    ? `${progress.message || '正在构建图片索引'}${progress.total ? ` · ${progress.completed} / ${progress.total}` : ''}`
+    : `${state.counts.indexed || 0} 已索引 · ${state.counts.unindexed || 0} 未索引${state.counts.failed ? ` · ${state.counts.failed} 失败` : ''}`;
 }
 
 async function pollIndexProgress(request) {
@@ -396,9 +703,23 @@ async function pollIndexProgress(request) {
       state.indexTimer = null;
       if (progress.stage === 'done' || progress.stage === 'done_with_errors') {
         await reloadCounts();
+        if (['all','recent','favorites'].includes(state.page)) await reloadCurrent();
         if (progress.stage === 'done_with_errors') toast(`原图索引完成，有 ${progress.failed} 张照片未能建立索引`);
         else toast('原图向量索引已完成');
-      } else if (progress.stage === 'cancelled') toast('原图索引已停止');
+        if (state.setupIndexRun) {
+          state.setupIndexRun = false;
+          finishSetup();
+        }
+      } else if (progress.stage === 'cancelled') {
+        state.setupIndexRun = false;
+        setupStatus('索引已停止。已完成的内容会保留，可以重新开始或跳过索引。');
+        toast('原图索引已停止');
+        renderSetup();
+      } else if (progress.stage === 'error') {
+        state.setupIndexRun = false;
+        setupStatus(progress.message || '索引失败，请检查照片来源后重试。');
+        renderSetup();
+      }
       return;
     }
   } catch (error) {
@@ -406,7 +727,8 @@ async function pollIndexProgress(request) {
   }
 }
 
-function startIndexing() {
+function startIndexing(fromSetup = false) {
+  if (fromSetup) setupIndexDates();
   const startDate = $('#indexStartDate').value;
   const endDate = $('#indexEndDate').value;
   if (!startDate || !endDate || startDate > endDate) { toast('请选择有效的索引开始和结束日期'); return; }
@@ -417,8 +739,10 @@ function startIndexing() {
   const utcBoundary = date => date.toISOString().replace(/\.\d{3}Z$/, 'Z');
   const input = {
     startDate, endDate, startAt: utcBoundary(startLocal), endBefore: utcBoundary(endLocal),
-    source: $('#indexSource').value,
+    source: fromSetup ? setupChosenIndexSource() : $('#indexSource').value,
   };
+  state.setupIndexRun = fromSetup;
+  if (fromSetup) setupStatus('正在读取所选日期范围的照片并建立索引…', true);
   $('#startIndexBtn').disabled = true;
   $('#stopIndexBtn').disabled = true;
   $('#indexProgress').classList.add('show');
@@ -437,6 +761,10 @@ function startIndexing() {
     $('#stopIndexBtn').disabled = true;
     $('#indexProgressText').textContent = `索引启动失败：${error}`;
     toast(`原图索引失败：${error}`);
+    if (fromSetup) {
+      state.setupIndexRun = false;
+      setupStatus(`索引启动失败：${error}`);
+    }
   });
 }
 
@@ -468,12 +796,12 @@ async function fetchNativeAssets(source, offset = 0) {
   const response = await invoke('list_assets', { args: {
     page: state.page, source: nativeSource,
     ruleId: state.page === 'cleanup' ? state.ruleId : null,
-    query: null, offset, limit: state.limit,
+    query: null, offset, limit: state.limit, mediaType: state.mediaType, indexStatus: state.indexStatus,
   } });
   const rows = response.assets || [];
   let usbTotal = state.usbViewTotal;
   if (state.source === 'all' && state.page !== 'queue' && state.page !== 'cleanup' && offset === 0) {
-    const usb = await invoke('list_assets', { args: { page: state.page, source: 'usb', ruleId: null, query: null, offset: 0, limit: state.limit } });
+    const usb = await invoke('list_assets', { args: { page: state.page, source: 'usb', ruleId: null, query: null, offset: 0, limit: state.limit, mediaType: state.mediaType, indexStatus: state.indexStatus } });
     const usbRows = usb.assets || [];
     const visibleUsbRows = state.page === 'favorites' ? usbRows.filter(asset => asset.favorite) : usbRows;
     rows.push(...visibleUsbRows);
@@ -518,6 +846,7 @@ function processThumbnails() {
 async function syncAll() {
   try {
     const data = await invoke('bootstrap');
+    state.modelState = data.modelState || state.modelState;
     state.photoStatus = data.photos?.status || 'unknown';
     state.usbStatus = data.usb?.status || 'disconnected';
     state.rules = data.rules || [];
@@ -613,9 +942,21 @@ async function reloadCurrent(offset = 0) {
       else { state.assets = []; state.total = 0; renderGrid(); }
       return;
     }
-    if (state.page === 'all' && state.source === 'all') {
-      const photos = await invoke('list_assets', { args: { page: 'all', source: 'photos', ruleId: null, query: null, offset: 0, limit: state.limit } });
-      const usb = await invoke('list_assets', { args: { page: 'all', source: 'usb', ruleId: null, query: null, offset: 0, limit: state.limit } });
+    if (['all','recent','favorites'].includes(state.page) && state.source === 'all') {
+      if (state.page !== 'all') {
+        const response = await invoke('list_assets', { args: {
+          page: state.page, source: 'all', ruleId: null, query: null,
+          offset, limit: state.limit, mediaType: state.mediaType, indexStatus: state.indexStatus,
+        } });
+        const rows = response.assets || [];
+        state.assets = offset ? [...state.assets, ...rows] : rows;
+        state.offset = offset;
+        state.total = response.total ?? rows.length;
+        loadPhotoThumbs(rows); renderGrid(); return;
+      }
+      const libraryFilters = { mediaType: state.mediaType, indexStatus: state.indexStatus };
+      const photos = await invoke('list_assets', { args: { page: state.page, source: 'photos', ruleId: null, query: null, offset: 0, limit: state.limit, ...libraryFilters } });
+      const usb = await invoke('list_assets', { args: { page: state.page, source: 'usb', ruleId: null, query: null, offset: 0, limit: state.limit, ...libraryFilters } });
       state.assets = [...(photos.assets || []), ...(usb.assets || [])];
       state.offset = 0; state.photoOffset = (photos.assets || []).length; state.usbOffset = (usb.assets || []).length;
       state.photoTotal = photos.total || 0;
@@ -623,8 +964,8 @@ async function reloadCurrent(offset = 0) {
       state.total = (photos.total || 0) + state.usbViewTotal;
       loadPhotoThumbs(state.assets); renderGrid(); return;
     }
-    if (state.page === 'all' && state.source === 'usb') {
-      const response = await invoke('list_assets', { args: { page: 'all', source: 'usb', ruleId: null, query: null, offset: 0, limit: state.limit } });
+    if (['all','recent','favorites'].includes(state.page) && state.source === 'usb') {
+      const response = await invoke('list_assets', { args: { page: state.page, source: 'usb', ruleId: null, query: null, offset: 0, limit: state.limit, mediaType: state.mediaType, indexStatus: state.indexStatus } });
       const rows = response.assets || [];
       state.assets = rows; state.offset = 0; state.photoOffset = 0; state.usbOffset = rows.length;
       state.total = response.total || 0; state.usbViewTotal = state.total;
@@ -650,11 +991,22 @@ async function reloadCurrent(offset = 0) {
       state.reviewCounts = { pending: response.pending ?? 0, later: response.later ?? 0 };
       loadPhotoThumbs(rows); renderGrid(); return;
     }
-    if (state.page === 'all' && state.source === 'photos') {
-      const response = await invoke('list_assets', { args: { page: 'all', source: 'photos', ruleId: null, query: null, offset: 0, limit: state.limit } });
+    if (['all','recent','favorites'].includes(state.page) && state.source === 'photos') {
+      const response = await invoke('list_assets', { args: { page: state.page, source: 'photos', ruleId: null, query: null, offset: 0, limit: state.limit, mediaType: state.mediaType, indexStatus: state.indexStatus } });
       const rows = response.assets || [];
       state.assets = rows; state.offset = 0; state.photoOffset = rows.length; state.usbOffset = 0;
       state.total = response.total || 0; state.photoTotal = state.total;
+      loadPhotoThumbs(rows); renderGrid(); return;
+    }
+    if (['recent', 'favorites'].includes(state.page)) {
+      const response = await invoke('list_assets', { args: {
+        page: state.page, source: state.source, ruleId: null, query: null,
+        offset, limit: state.limit, mediaType: state.mediaType, indexStatus: state.indexStatus,
+      } });
+      const rows = response.assets || [];
+      state.assets = offset ? [...state.assets, ...rows] : rows;
+      state.offset = offset;
+      state.total = response.total ?? rows.length;
       loadPhotoThumbs(rows); renderGrid(); return;
     }
     await fetchNativeAssets(state.source, offset);
@@ -662,7 +1014,7 @@ async function reloadCurrent(offset = 0) {
 }
 
 async function loadMoreLibrary() {
-  if (state.page === 'cleanup' || state.page === 'queue') {
+  if (['cleanup', 'queue', 'recent', 'favorites'].includes(state.page)) {
     const next = state.offset + state.limit;
     if (next < state.total) await reloadCurrent(next);
     return;
@@ -675,7 +1027,7 @@ async function loadMoreLibrary() {
       const total = source === 'usb' ? state.usbViewTotal : state.photoTotal;
       if (loaded >= total) continue;
       const response = await invoke('list_assets', { args: {
-        page: 'all', source, ruleId: null, query: null, offset: loaded, limit: state.limit,
+        page: 'all', source, ruleId: null, query: null, offset: loaded, limit: state.limit, mediaType: state.mediaType, indexStatus: state.indexStatus,
       } });
       const rows = response.assets || [];
       if (!rows.length) continue;
@@ -690,14 +1042,12 @@ async function loadMoreLibrary() {
 
 async function reloadCounts() {
   try {
-    const status = await invoke('app_status');
+    const [status, modelProgress] = await Promise.all([invoke('app_status'), invoke('model_progress')]);
+    state.modelProgress = modelProgress;
+    state.modelState = modelProgress.state;
     if (status.counts) {
       state.counts = {
         ...status.counts,
-        // Native library totals come from Photos / ImageCaptureCore. The DB only
-        // contains indexed pages, so keep those totals across review-state refreshes.
-        photos: state.counts.photos,
-        usb: state.counts.usb,
       };
     }
     state.rules = await invoke('list_rules').catch(() => state.rules);
@@ -840,6 +1190,32 @@ document.querySelectorAll('.nav-item[data-page]').forEach(button => button.addEv
   if (state.page !== 'similar') state.similarAnchor = null;
   renderGrid(); await reloadCurrent();
 }));
+$('#setupNext').addEventListener('click', setupNext);
+$('#setupBack').addEventListener('click', setupBack);
+$('#setupSkip').addEventListener('click', finishSetup);
+$('#setupAuthorizePhotos').addEventListener('click', authorizeSetupPhotos);
+$('#setupSyncSources').addEventListener('click', syncSetupSources);
+$('#setupSourceChoices').querySelectorAll('input').forEach(input => input.addEventListener('change', renderSetup));
+$('#environmentIndexBtn').addEventListener('click', async () => {
+  state.source = $('#sourceSelect').value;
+  openIndexPage();
+  defaultIndexDates();
+  $('#indexSource').value = state.source;
+  await reloadCounts();
+});
+$('#indexStatusFilter').addEventListener('change', async event => {
+  state.indexStatus = event.target.value;
+  resetLibraryOffsets(); state.assets = []; state.selected.clear(); state.focus = null;
+  await reloadCurrent();
+});
+$('#mediaTypeFilter').addEventListener('change', async event => {
+  state.mediaType = event.target.value;
+  if (state.mediaType === 'video') state.indexStatus = 'unsupported';
+  else if (state.indexStatus === 'unsupported') state.indexStatus = 'all';
+  resetLibraryOffsets(); state.assets = []; state.selected.clear(); state.focus = null;
+  decoratePage();
+  await reloadCurrent();
+});
 document.querySelectorAll('.tab').forEach(button => button.addEventListener('click', async () => {
   state.tab = button.dataset.tab;
   state.selected.clear();
@@ -864,6 +1240,11 @@ $('#stopIndexBtn').addEventListener('click', async () => {
   $('#stopIndexBtn').disabled = true;
   try { await invoke('stop_indexing'); }
   catch (error) { $('#stopIndexBtn').disabled = false; toast(`停止索引失败：${error}`); }
+});
+$('#setupStopIndex').addEventListener('click', async () => {
+  $('#setupStopIndex').disabled = true;
+  try { await invoke('stop_indexing'); }
+  catch (error) { $('#setupStopIndex').disabled = false; setupStatus(`停止索引失败：${error}`); }
 });
 $('#closeOriginal').addEventListener('click', closeOriginalViewer);
 $('#originalModal').addEventListener('click', event => { if (event.target === $('#originalModal')) closeOriginalViewer(); });
@@ -950,6 +1331,9 @@ await syncAll();
 await reloadCurrent();
 defaultIndexDates();
 try {
+  if (localStorage.getItem('shiguangSetupV2Complete') !== 'true') openSetup();
+} catch { openSetup(); }
+try {
   const initialIndexProgress = await invoke('index_progress');
   if (initialIndexProgress.running || ['done', 'done_with_errors', 'cancelled', 'error'].includes(initialIndexProgress.stage)) {
     showIndexProgress(initialIndexProgress);
@@ -995,3 +1379,4 @@ setInterval(async () => {
     } catch { /* 初始 Rust 状态仍在加载时忽略。 */ }
   }
 }, 18000);
+setInterval(pollModelSetup, 800);

@@ -40,15 +40,18 @@ private func photoAuthorizationName(_ status: PHAuthorizationStatus) -> String {
     }
 }
 
-private func photoPage(offset: Int, limit: Int, favoritesOnly: Bool = false) -> (assets: [PHAsset], total: Int) {
+private func photoPage(offset: Int, limit: Int, favoritesOnly: Bool = false, mediaType: Int = 1) -> (assets: [PHAsset], total: Int) {
     let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
     guard status == .authorized || status == .limited else { return ([], 0) }
     let options = PHFetchOptions()
     options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-    let images = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
-    options.predicate = favoritesOnly
-        ? NSCompoundPredicate(andPredicateWithSubpredicates: [images, NSPredicate(format: "isFavorite == YES")])
-        : images
+    let mediaPredicate: NSPredicate? = switch mediaType {
+    case PHAssetMediaType.image.rawValue: NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
+    case PHAssetMediaType.video.rawValue: NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue)
+    default: nil
+    }
+    let predicates = [mediaPredicate, favoritesOnly ? NSPredicate(format: "isFavorite == YES") : nil].compactMap { $0 }
+    if !predicates.isEmpty { options.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: predicates) }
     let result = PHAsset.fetchAssets(with: options)
     let start = max(0, offset)
     let end = min(result.count, start + min(200, max(1, limit)))
@@ -62,7 +65,12 @@ private func photoPage(offset: Int, limit: Int, favoritesOnly: Bool = false) -> 
 @_cdecl("shiguang_photos_status")
 public func shiguangPhotosStatus() -> SRString {
     let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
-    return SRString(json(["status": photoAuthorizationName(status), "count": photoPage(offset: 0, limit: 1).total]))
+    let authorized = status == .authorized || status == .limited
+    let imageCount = authorized ? photoPage(offset: 0, limit: 1, mediaType: PHAssetMediaType.image.rawValue).total : 0
+    let videoCount = authorized ? photoPage(offset: 0, limit: 1, mediaType: PHAssetMediaType.video.rawValue).total : 0
+    let mediaCount = imageCount + videoCount
+    return SRString(json(["status": photoAuthorizationName(status), "count": imageCount,
+                          "imageCount": imageCount, "videoCount": videoCount, "mediaCount": mediaCount]))
 }
 
 @_cdecl("shiguang_photos_request_authorization")
@@ -82,6 +90,19 @@ public func shiguangPhotosList(_ offset: Int, _ limit: Int, _ favorites: Int) ->
     let rows: [[String: Any]] = page.assets.map { asset in
         ["id": asset.localIdentifier, "source": "photos",
          "name": asset.value(forKey: "filename") as? String ?? "照片",
+         "date": asset.creationDate.map { ISO8601DateFormatter().string(from: $0) } ?? "",
+         "width": asset.pixelWidth, "height": asset.pixelHeight, "favorite": asset.isFavorite,
+         "mediaType": asset.mediaType == .video ? "video" : "image"]
+    }
+    return SRString(json(["status": "ok", "total": page.total, "assets": rows]))
+}
+
+@_cdecl("shiguang_photos_library_list")
+public func shiguangPhotosLibraryList(_ offset: Int, _ limit: Int, _ mediaType: Int) -> SRString {
+    let page = photoPage(offset: Int(offset), limit: Int(limit), mediaType: Int(mediaType))
+    let rows: [[String: Any]] = page.assets.map { asset in
+        ["id": asset.localIdentifier, "source": "photos",
+         "name": asset.value(forKey: "filename") as? String ?? (asset.mediaType == .video ? "视频" : "照片"),
          "date": asset.creationDate.map { ISO8601DateFormatter().string(from: $0) } ?? "",
          "width": asset.pixelWidth, "height": asset.pixelHeight, "favorite": asset.isFavorite,
          "mediaType": asset.mediaType == .video ? "video" : "image"]
@@ -321,20 +342,27 @@ private final class USBSession: NSObject, ICDeviceBrowserDelegate, ICDeviceDeleg
         }
         let connected = camera != nil
         let state = lastError != nil ? "error" : connected ? (ready ? "connected" : "indexing") : (searching ? "searching" : "disconnected")
-        let status: [String: Any] = ["status": state,
+        var status: [String: Any] = ["status": state,
                                      "error": lastError ?? (connected ? "" : (searching ? "正在查找已连接的 iPhone" : "请连接并解锁 iPhone")),
                                      "device": camera?.name ?? "iPhone"]
         let rows: [[String: Any]] = ready ? files.values.map { file in
             ["id": identifier(for: file), "source": "usb", "name": file.name ?? "iPhone 照片",
              "date": file.creationDate.map { ISO8601DateFormatter().string(from: $0) } ?? "",
-             "width": file.width, "height": file.height, "favorite": false, "mediaType": "image"] as [String: Any]
+             "width": file.width, "height": file.height, "favorite": false,
+             "mediaType": UTType(file.uti ?? "")?.conforms(to: .image) == true ? "image" : "video"] as [String: Any]
         }.sorted { left, right in
             let leftDate = (left["date"] as? String) ?? ""
             let rightDate = (right["date"] as? String) ?? ""
             if leftDate != rightDate { return leftDate > rightDate }
             return (left["name"] as? String ?? "") < (right["name"] as? String ?? "")
         } : []
-        let list = json(["status": state, "error": status["error"] ?? "", "device": camera?.name ?? "iPhone", "total": rows.count, "assets": Array(rows.prefix(48))])
+        let imageCount = rows.filter { $0["mediaType"] as? String == "image" }.count
+        let videoCount = rows.count - imageCount
+        let list = json(["status": state, "error": status["error"] ?? "", "device": camera?.name ?? "iPhone",
+                         "total": rows.count, "imageCount": imageCount, "videoCount": videoCount, "assets": Array(rows.prefix(48))])
+        status["total"] = rows.count
+        status["imageCount"] = imageCount
+        status["videoCount"] = videoCount
         let statusJSON = json(status)
         snapshotLock.lock()
         allRows = rows
@@ -436,7 +464,8 @@ private final class USBSession: NSObject, ICDeviceBrowserDelegate, ICDeviceDeleg
         for item in items {
             guard let file = item as? ICCameraFile,
                   let rawUTI = file.uti,
-                  UTType(rawUTI)?.conforms(to: .image) == true else { continue }
+                  let type = UTType(rawUTI),
+                  type.conforms(to: .image) || type.conforms(to: .movie) else { continue }
             files[identifier(for: file)] = file
         }
     }
@@ -451,7 +480,8 @@ private final class USBSession: NSObject, ICDeviceBrowserDelegate, ICDeviceDeleg
         let start = min(max(0, offset), allRows.count)
         let end = min(allRows.count, start + min(200, max(1, limit)))
         let rows = start < end ? Array(allRows[start..<end]) : []
-        return json(["status": state["status"] ?? "searching", "error": state["error"] ?? "", "device": state["device"] ?? "iPhone", "total": allRows.count, "assets": rows])
+        return json(["status": state["status"] ?? "searching", "error": state["error"] ?? "", "device": state["device"] ?? "iPhone",
+                     "total": allRows.count, "imageCount": state["imageCount"] ?? 0, "videoCount": state["videoCount"] ?? 0, "assets": rows])
     }
 
     func status() -> String {

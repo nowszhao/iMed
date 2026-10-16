@@ -11,6 +11,7 @@ use std::io::Seek;
 use std::num::ParseIntError;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Arc, OnceLock, RwLock};
 use thiserror::Error;
 use ureq::{Agent, AgentBuilder, RedirectAuthHeaders, Request};
 
@@ -45,6 +46,56 @@ impl<P: Progress, R: Read> Read for Wrapper<'_, P, R> {
         let read = self.inner.read(buf)?;
         self.progress.update(read);
         Ok(read)
+    }
+}
+
+/// Callback used to report a Hub download's filename and byte progress.
+pub type DownloadProgressHandler = Arc<dyn Fn(&str, u64, u64) + Send + Sync>;
+static DOWNLOAD_PROGRESS_HANDLER: OnceLock<RwLock<Option<DownloadProgressHandler>>> = OnceLock::new();
+
+/// Install an optional process-wide callback for synchronous Hub downloads.
+/// The callback receives the filename, downloaded bytes, and total bytes.
+/// Pass `None` to clear it. This is useful when a library owns the Hub client
+/// internally but an application still needs to display download progress.
+pub fn set_download_progress_handler(handler: Option<DownloadProgressHandler>) {
+    *DOWNLOAD_PROGRESS_HANDLER
+        .get_or_init(|| RwLock::new(None))
+        .write()
+        .expect("download progress handler lock poisoned") = handler;
+}
+
+struct CallbackProgress {
+    filename: String,
+    current: u64,
+    total: u64,
+    handler: DownloadProgressHandler,
+}
+
+impl Progress for CallbackProgress {
+    fn init(&mut self, size: usize, filename: &str) {
+        self.filename = filename.to_string();
+        self.current = 0;
+        self.total = size as u64;
+        (self.handler)(&self.filename, self.current, self.total);
+    }
+
+    fn update(&mut self, size: usize) {
+        self.current = self.current.saturating_add(size as u64).min(self.total);
+        (self.handler)(&self.filename, self.current, self.total);
+    }
+
+    fn finish(&mut self) {
+        self.current = self.total;
+        (self.handler)(&self.filename, self.current, self.total);
+    }
+}
+
+fn callback_progress(filename: &str, handler: DownloadProgressHandler) -> CallbackProgress {
+    CallbackProgress {
+        filename: filename.to_string(),
+        current: 0,
+        total: 0,
+        handler,
     }
 }
 
@@ -717,6 +768,13 @@ impl ApiRepo {
     pub fn get(&self, filename: &str) -> Result<PathBuf, ApiError> {
         if let Some(path) = self.api.cache.repo(self.repo.clone()).get(filename) {
             Ok(path)
+        } else if let Some(handler) = DOWNLOAD_PROGRESS_HANDLER
+            .get_or_init(|| RwLock::new(None))
+            .read()
+            .expect("download progress handler lock poisoned")
+            .clone()
+        {
+            self.download_with_progress(filename, callback_progress(filename, handler))
         } else {
             self.download(filename)
         }

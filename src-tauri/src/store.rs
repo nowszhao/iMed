@@ -24,6 +24,16 @@ pub fn initialize(db: &Connection) -> rusqlite::Result<()> {
            vector BLOB NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
            PRIMARY KEY(asset_key, model_version), FOREIGN KEY(asset_key) REFERENCES assets(asset_key) ON DELETE CASCADE
          );
+         CREATE TABLE IF NOT EXISTS index_failures (
+           asset_key TEXT NOT NULL, model_version TEXT NOT NULL, error TEXT NOT NULL,
+           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+           PRIMARY KEY(asset_key, model_version),
+           FOREIGN KEY(asset_key) REFERENCES assets(asset_key) ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS source_syncs (
+           source TEXT PRIMARY KEY, media_count INTEGER NOT NULL DEFAULT 0,
+           synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );
          CREATE TABLE IF NOT EXISTS rules (
            id TEXT PRIMARY KEY, name TEXT NOT NULL, prompt TEXT NOT NULL, exclude_prompt TEXT NOT NULL DEFAULT '',
            threshold REAL NOT NULL DEFAULT 0.35, enabled INTEGER NOT NULL DEFAULT 1,
@@ -144,7 +154,65 @@ pub fn save_embedding(db: &Connection, asset: &Asset, vector: &[f32]) -> rusqlit
         params![key,asset.source,asset.name,asset.date,asset.width,asset.height,asset.favorite,asset.media_type])?;
     let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
     db.execute("INSERT INTO embeddings(asset_key,model_version,dimensions,vector) VALUES(?1,?2,?3,?4) ON CONFLICT(asset_key,model_version) DO UPDATE SET dimensions=excluded.dimensions,vector=excluded.vector,updated_at=CURRENT_TIMESTAMP", params![key,EMBEDDER_VERSION,vector.len() as i64,bytes])?;
+    db.execute("DELETE FROM index_failures WHERE asset_key=?1 AND model_version=?2", params![key, EMBEDDER_VERSION])?;
     Ok(())
+}
+
+pub fn mark_index_failure(db: &Connection, asset: &Asset, error: &str) -> rusqlite::Result<()> {
+    let key = format!("{}:{}", asset.source, asset.id);
+    db.execute("INSERT INTO index_failures(asset_key,model_version,error,updated_at) VALUES(?1,?2,?3,CURRENT_TIMESTAMP) ON CONFLICT(asset_key,model_version) DO UPDATE SET error=excluded.error,updated_at=CURRENT_TIMESTAMP", params![key, EMBEDDER_VERSION, error])?;
+    Ok(())
+}
+
+/// Clears the "fully synced" marker so a running or failed sync is never
+/// reported as complete.
+pub fn invalidate_source_sync(db: &Connection, source: &str) -> rusqlite::Result<()> {
+    db.execute("DELETE FROM source_syncs WHERE source=?1", [source])?;
+    Ok(())
+}
+
+/// Commits one complete listing for a source: upserts every asset, drops rows
+/// that disappeared from the source, then records the source as fully synced.
+/// Media the user already queued for deletion is kept so a pending batch is
+/// never silently destroyed.
+pub fn finish_source_sync(db: &Connection, source: &str, assets: &[Asset]) -> rusqlite::Result<()> {
+    if !matches!(source, "photos" | "usb") || assets.iter().any(|asset| asset.source != source) {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "source sync contains assets from another source".into(),
+        ));
+    }
+    let tx = db.unchecked_transaction()?;
+    tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS sync_keys(key TEXT PRIMARY KEY); DELETE FROM sync_keys;")?;
+    for asset in assets {
+        let key = format!("{}:{}", asset.source, asset.id);
+        tx.execute(
+            "INSERT INTO assets(asset_key,source,name,created_at,width,height,favorite,media_type) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(asset_key) DO UPDATE SET name=excluded.name,created_at=excluded.created_at,width=excluded.width,height=excluded.height,favorite=excluded.favorite,media_type=excluded.media_type",
+            params![&key, asset.source, asset.name, asset.date, asset.width, asset.height, asset.favorite, asset.media_type],
+        )?;
+        tx.execute("INSERT OR REPLACE INTO sync_keys(key) VALUES(?1)", [&key])?;
+    }
+    tx.execute(
+        "DELETE FROM assets WHERE source=?1 AND queued=0 AND asset_key NOT IN (SELECT key FROM sync_keys)",
+        [source],
+    )?;
+    tx.execute_batch("DELETE FROM sync_keys;")?;
+    tx.execute(
+        "INSERT INTO source_syncs(source,media_count,synced_at) VALUES(?1,?2,CURRENT_TIMESTAMP) ON CONFLICT(source) DO UPDATE SET media_count=excluded.media_count,synced_at=CURRENT_TIMESTAMP",
+        params![source, assets.len() as i64],
+    )?;
+    tx.commit()
+}
+
+pub fn source_is_current(db: &Connection, source: &str, current_count: i64) -> rusqlite::Result<bool> {
+    let synced_count = db.query_row("SELECT media_count FROM source_syncs WHERE source=?1", [source], |row| row.get::<_, i64>(0)).optional()?;
+    Ok(synced_count == Some(current_count))
+}
+
+fn asset_index_status(db: &Connection, key: &str) -> rusqlite::Result<String> {
+    let indexed: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM embeddings WHERE asset_key=?1 AND model_version=?2)", params![key, EMBEDDER_VERSION], |r| r.get(0))?;
+    if indexed { return Ok("indexed".into()); }
+    let failed: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM index_failures WHERE asset_key=?1 AND model_version=?2)", params![key, EMBEDDER_VERSION], |r| r.get(0))?;
+    Ok(if failed { "failed" } else { "pending" }.into())
 }
 
 pub fn cached_embedding(db: &Connection, asset: &Asset) -> Result<Option<Vec<f32>>, String> {
@@ -224,6 +292,7 @@ pub fn decorate_asset(db: &Connection, asset: &mut Asset) -> Result<(), String> 
     asset.queued = state.1;
     asset.score = state.2;
     asset.rule_id = state.3;
+    asset.index_status = asset_index_status(db, &key).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -254,12 +323,12 @@ pub fn set_review(db: &Connection, input: ReviewInput) -> rusqlite::Result<()> {
 
 pub fn counts(db: &Connection) -> rusqlite::Result<Value> {
     let photos: i64 = db.query_row(
-        "SELECT count(*) FROM assets WHERE source='photos' AND deleted_at IS NULL",
+        "SELECT count(*) FROM assets WHERE source='photos' AND deleted_at IS NULL AND media_type='image'",
         [],
         |r| r.get(0),
     )?;
     let usb: i64 = db.query_row(
-        "SELECT count(*) FROM assets WHERE source='usb' AND deleted_at IS NULL",
+        "SELECT count(*) FROM assets WHERE source='usb' AND deleted_at IS NULL AND media_type='image'",
         [],
         |r| r.get(0),
     )?;
@@ -269,7 +338,43 @@ pub fn counts(db: &Connection) -> rusqlite::Result<Value> {
         |r| r.get(0),
     )?;
     let candidates: i64 = db.query_row("SELECT count(DISTINCT m.asset_key) FROM matches m JOIN rules r ON r.id=m.rule_id JOIN assets a USING(asset_key) WHERE m.score>=r.threshold AND a.review_state='pending' AND a.queued=0 AND a.deleted_at IS NULL",[],|r|r.get(0))?;
-    Ok(json!({"photos":photos,"usb":usb,"queued":queued,"candidates":candidates}))
+    let indexed: i64 = db.query_row("SELECT count(*) FROM embeddings e JOIN assets a USING(asset_key) WHERE e.model_version=?1 AND a.deleted_at IS NULL AND a.media_type='image'", [EMBEDDER_VERSION], |r| r.get(0))?;
+    let indexed_photos: i64 = db.query_row("SELECT count(*) FROM embeddings e JOIN assets a USING(asset_key) WHERE e.model_version=?1 AND a.source='photos' AND a.deleted_at IS NULL AND a.media_type='image'", [EMBEDDER_VERSION], |r| r.get(0))?;
+    let indexed_usb: i64 = db.query_row("SELECT count(*) FROM embeddings e JOIN assets a USING(asset_key) WHERE e.model_version=?1 AND a.source='usb' AND a.deleted_at IS NULL AND a.media_type='image'", [EMBEDDER_VERSION], |r| r.get(0))?;
+    let failed: i64 = db.query_row("SELECT count(*) FROM index_failures f JOIN assets a USING(asset_key) WHERE f.model_version=?1 AND a.deleted_at IS NULL AND a.media_type='image' AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.asset_key=f.asset_key AND e.model_version=f.model_version)", [EMBEDDER_VERSION], |r| r.get(0))?;
+    let failed_photos: i64 = db.query_row("SELECT count(*) FROM index_failures f JOIN assets a USING(asset_key) WHERE f.model_version=?1 AND a.source='photos' AND a.deleted_at IS NULL AND a.media_type='image' AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.asset_key=f.asset_key AND e.model_version=f.model_version)", [EMBEDDER_VERSION], |r| r.get(0))?;
+    let failed_usb: i64 = db.query_row("SELECT count(*) FROM index_failures f JOIN assets a USING(asset_key) WHERE f.model_version=?1 AND a.source='usb' AND a.deleted_at IS NULL AND a.media_type='image' AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.asset_key=f.asset_key AND e.model_version=f.model_version)", [EMBEDDER_VERSION], |r| r.get(0))?;
+    let known_images: i64 = db.query_row("SELECT count(*) FROM assets WHERE deleted_at IS NULL AND media_type='image'", [], |r| r.get(0))?;
+    let photos_videos: i64 = db.query_row("SELECT count(*) FROM assets WHERE source='photos' AND deleted_at IS NULL AND media_type='video'", [], |r| r.get(0))?;
+    let usb_videos: i64 = db.query_row("SELECT count(*) FROM assets WHERE source='usb' AND deleted_at IS NULL AND media_type='video'", [], |r| r.get(0))?;
+    let unsupported: i64 = photos_videos + usb_videos;
+    Ok(json!({"photos":photos,"usb":usb,"photosVideos":photos_videos,"usbVideos":usb_videos,"unsupported":unsupported,"queued":queued,"candidates":candidates,"indexed":indexed,"indexedPhotos":indexed_photos,"indexedUsb":indexed_usb,"failed":failed,"failedPhotos":failed_photos,"failedUsb":failed_usb,"unindexed":(known_images-indexed-failed).max(0)}))
+}
+
+pub fn list_library(
+    db: &Connection,
+    source: &str,
+    _media_type: Option<&str>,
+    index_status: Option<&str>,
+    favorites_only: bool,
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<Asset>, usize), String> {
+    let source = if matches!(source, "photos" | "usb") { source } else { "all" };
+    let media_type = _media_type.filter(|value| matches!(*value, "image" | "video" | "all")).unwrap_or("all");
+    let index_status = index_status.filter(|value| matches!(*value, "all" | "indexed" | "pending" | "failed" | "unsupported")).unwrap_or("all");
+    let where_clause = "a.deleted_at IS NULL AND (?1='all' OR a.source=?1) AND (?2='all' OR a.media_type=?2) AND (?3='all' OR (?3='indexed' AND a.media_type='image' AND EXISTS(SELECT 1 FROM embeddings e WHERE e.asset_key=a.asset_key AND e.model_version=?4)) OR (?3='failed' AND a.media_type='image' AND EXISTS(SELECT 1 FROM index_failures f WHERE f.asset_key=a.asset_key AND f.model_version=?4) AND NOT EXISTS(SELECT 1 FROM embeddings e WHERE e.asset_key=a.asset_key AND e.model_version=?4)) OR (?3='pending' AND a.media_type='image' AND NOT EXISTS(SELECT 1 FROM embeddings e WHERE e.asset_key=a.asset_key AND e.model_version=?4) AND NOT EXISTS(SELECT 1 FROM index_failures f WHERE f.asset_key=a.asset_key AND f.model_version=?4)) OR (?3='unsupported' AND a.media_type='video'))";
+    let total: i64 = db.query_row(&format!("SELECT count(*) FROM assets a WHERE {where_clause} AND (?5=0 OR a.favorite=1)"), params![source, media_type, index_status, EMBEDDER_VERSION, favorites_only as i64], |row| row.get(0)).map_err(|e|e.to_string())?;
+    let mut stmt = db.prepare(&format!("SELECT a.asset_key,a.source,a.name,a.created_at,a.width,a.height,a.favorite,a.media_type,a.thumbnail,a.review_state,a.queued,(SELECT max(m.score) FROM matches m WHERE m.asset_key=a.asset_key),(SELECT m.rule_id FROM matches m WHERE m.asset_key=a.asset_key ORDER BY m.score DESC LIMIT 1),CASE WHEN a.media_type='video' THEN 'unsupported' WHEN EXISTS(SELECT 1 FROM embeddings e WHERE e.asset_key=a.asset_key AND e.model_version=?4) THEN 'indexed' WHEN EXISTS(SELECT 1 FROM index_failures f WHERE f.asset_key=a.asset_key AND f.model_version=?4) THEN 'failed' ELSE 'pending' END FROM assets a WHERE {where_clause} AND (?5=0 OR a.favorite=1) ORDER BY a.created_at DESC,a.asset_key LIMIT ?6 OFFSET ?7")).map_err(|e|e.to_string())?;
+    let rows = stmt.query_map(params![source,media_type,index_status,EMBEDDER_VERSION,favorites_only as i64,limit.clamp(1,200) as i64,offset as i64], |row| {
+        let key: String = row.get(0)?;
+        Ok(Asset {
+            id: key.split_once(':').map(|(_, id)| id).unwrap_or(&key).to_owned(),
+            source: row.get(1)?, name: row.get(2)?, date: row.get(3)?, width: row.get(4)?, height: row.get(5)?, favorite: row.get(6)?, media_type: row.get(7)?, thumbnail: row.get(8)?, reviewed: row.get(9)?, queued: row.get(10)?, score: row.get(11)?, rule_id: row.get(12)?, index_status: row.get(13)?,
+        })
+    }).map_err(|e|e.to_string())?;
+    let assets = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;
+    Ok((assets, total.max(0) as usize))
 }
 
 pub fn cached_thumbnail(db: &Connection, key: &str) -> Result<Option<String>, String> {
@@ -412,16 +517,26 @@ pub fn semantic_search(
         .collect())
 }
 
+/// True when every word of the query matches a whole word of the file name,
+/// so "hair" hits "hair.jpg" but not "hairbrush.jpg". Whole-word matching keeps
+/// a common token such as "IMG" from rescuing an entire library.
 fn normalized_exact_name_match(name: &str, query: &str) -> bool {
-    let normalize = |value: &str| {
-        value.chars()
-            .filter(|character| character.is_alphanumeric())
+    let words = |value: &str| -> Vec<String> {
+        value
+            .chars()
             .flat_map(char::to_lowercase)
+            .map(|character| if character.is_alphanumeric() { character } else { ' ' })
             .collect::<String>()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
     };
-    let name = normalize(name);
-    let query = normalize(query);
-    !query.is_empty() && !name.is_empty() && name.contains(&query)
+    let query = words(query);
+    if query.is_empty() {
+        return false;
+    }
+    let name = words(name);
+    query.iter().all(|part| name.iter().any(|word| word == part))
 }
 
 fn valid_search_vector(vector: &[f32]) -> bool {
@@ -585,6 +700,7 @@ pub fn assets_for_index(
             queued: row.get::<_, i64>(10)? != 0,
             score: row.get(11)?,
             rule_id: row.get(12)?,
+            index_status: "pending".into(),
         })
     }).map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
 }
@@ -637,6 +753,7 @@ pub fn list_queued(
                     thumbnail: row.get(10)?,
                     score: row.get(11)?,
                     rule_id: row.get(12)?,
+                    index_status: "pending".into(),
                 })
             },
         )
@@ -718,6 +835,7 @@ pub fn list_rule_matches(
                     thumbnail: row.get(10)?,
                     score: row.get(11)?,
                     rule_id: Some(rule_id.to_string()),
+                    index_status: "pending".into(),
                 })
             },
         )
@@ -768,24 +886,115 @@ pub fn mark_deleted(db: &Connection, ids: &[String]) -> rusqlite::Result<()> {
 mod tests {
     use super::*;
 
-    fn indexed_photo(db: &Connection, id: &str, score: f32) {
-        let asset = Asset {
+    fn test_asset(source: &str, id: &str, media_type: &str) -> Asset {
+        Asset {
             id: id.into(),
-            source: "photos".into(),
-            name: format!("{id}.jpg"),
+            source: source.into(),
+            name: format!("{id}.{}", if media_type == "video" { "mov" } else { "jpg" }),
             date: String::new(),
             width: 800,
             height: 600,
             favorite: false,
-            media_type: "image".into(),
+            media_type: media_type.into(),
             thumbnail: None,
             score: None,
             reviewed: "pending".into(),
             queued: false,
             rule_id: None,
-        };
+            index_status: "pending".into(),
+        }
+    }
+
+    fn indexed_photo(db: &Connection, id: &str, score: f32) {
+        let asset = test_asset("photos", id, "image");
         // Controlled cosine scores isolate retrieval from model inference.
         save_embedding(db, &asset, &[score, (1.0 - score * score).sqrt()]).unwrap();
+    }
+
+    #[test]
+    fn source_sync_reconciles_stale_assets_and_preserves_queued_items() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let retained = test_asset("photos", "retained", "image");
+        let stale = test_asset("photos", "stale", "image");
+        let queued = test_asset("photos", "queued", "image");
+        save_embedding(&db, &stale, &[1.0, 0.0]).unwrap();
+        finish_source_sync(&db, "photos", &[retained.clone(), stale.clone(), queued.clone()]).unwrap();
+        set_review(
+            &db,
+            ReviewInput {
+                ids: vec!["photos:queued".into()],
+                action: "queue".into(),
+            },
+        )
+        .unwrap();
+
+        let updated = test_asset("photos", "retained", "image");
+        finish_source_sync(&db, "photos", &[updated, test_asset("photos", "new", "video")]).unwrap();
+
+        assert!(source_is_current(&db, "photos", 2).unwrap());
+        let (rows, total) = list_library(&db, "photos", None, None, false, 0, 20).unwrap();
+        assert_eq!(total, 3, "the queued item stays available for review");
+        assert!(rows.iter().any(|asset| asset.id == "queued" && asset.queued));
+        assert!(rows.iter().any(|asset| asset.id == "new" && asset.media_type == "video"));
+        assert!(!rows.iter().any(|asset| asset.id == "stale"));
+        assert_eq!(embedding_count(&db, "all").unwrap(), 0, "stale vectors cascade with removed assets");
+    }
+
+    #[test]
+    fn invalidated_source_is_not_reported_as_fully_synced() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        finish_source_sync(&db, "photos", &[test_asset("photos", "one", "image")]).unwrap();
+        assert!(source_is_current(&db, "photos", 1).unwrap());
+
+        invalidate_source_sync(&db, "photos").unwrap();
+
+        assert!(!source_is_current(&db, "photos", 1).unwrap());
+    }
+
+    #[test]
+    fn source_sync_rejects_mixed_sources_without_changing_the_catalog() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let original = test_asset("photos", "one", "image");
+        finish_source_sync(&db, "photos", &[original]).unwrap();
+
+        assert!(finish_source_sync(&db, "photos", &[test_asset("usb", "two", "image")]).is_err());
+        assert!(source_is_current(&db, "photos", 1).unwrap());
+        assert_eq!(list_library(&db, "photos", None, None, false, 0, 20).unwrap().1, 1);
+    }
+
+    #[test]
+    fn library_filters_report_matching_totals_and_index_states() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let indexed = test_asset("photos", "indexed", "image");
+        let failed = test_asset("photos", "failed", "image");
+        let pending = test_asset("photos", "pending", "image");
+        let video = test_asset("photos", "video", "video");
+        sync_test_assets(&db, &[indexed.clone(), failed.clone(), pending, video.clone()]);
+        save_embedding(&db, &indexed, &[1.0, 0.0]).unwrap();
+        mark_index_failure(&db, &failed, "decode failed").unwrap();
+
+        let (rows, total) = list_library(&db, "all", Some("image"), Some("indexed"), false, 0, 1).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].index_status, "indexed");
+        assert_eq!(list_library(&db, "photos", Some("image"), Some("failed"), false, 0, 10).unwrap().1, 1);
+        assert_eq!(list_library(&db, "photos", Some("image"), Some("pending"), false, 0, 10).unwrap().1, 1);
+        let (videos, video_total) = list_library(&db, "photos", Some("video"), Some("unsupported"), false, 0, 10).unwrap();
+        assert_eq!(video_total, 1);
+        assert_eq!(videos[0].index_status, "unsupported");
+    }
+
+    fn sync_test_assets(db: &Connection, assets: &[Asset]) {
+        for asset in assets {
+            db.execute(
+                "INSERT INTO assets(asset_key,source,name,created_at,width,height,favorite,media_type) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![format!("{}:{}", asset.source, asset.id), asset.source, asset.name, asset.date, asset.width, asset.height, asset.favorite, asset.media_type],
+            ).unwrap();
+        }
     }
 
     #[test]
@@ -833,11 +1042,11 @@ mod tests {
         initialize(&db).unwrap();
         indexed_photo(&db, "hair", 0.80);
         assert!(
-            semantic_search(&db, &[1.0, 0.0], "hair", 120, "all", false)
+            semantic_search(&db, &[1.0, 0.0], "portrait", 120, "all", false)
                 .unwrap()
                 .is_empty()
         );
-        let results = semantic_search(&db, &[1.0, 0.0], "hair", 120, "all", true).unwrap();
+        let results = semantic_search(&db, &[1.0, 0.0], "portrait", 120, "all", true).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["id"], "hair");
         assert_eq!(results[0]["weakMatch"], true);
@@ -852,7 +1061,20 @@ mod tests {
         }
         indexed_photo(&db, "noise", 0.501);
         assert!(
-            semantic_search(&db, &[1.0, 0.0], "noise", 120, "all", false)
+            semantic_search(&db, &[1.0, 0.0], "grain", 120, "all", false)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A file-name hit is deliberate, so it survives the same gate.
+        let named = semantic_search(&db, &[1.0, 0.0], "noise", 120, "all", false).unwrap();
+        let ids: Vec<_> = named.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["noise"]);
+        assert_eq!(named[0]["weakMatch"], false);
+
+        // Partial word hits stay subject to the gate.
+        assert!(
+            semantic_search(&db, &[1.0, 0.0], "nois", 120, "all", false)
                 .unwrap()
                 .is_empty()
         );
