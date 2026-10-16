@@ -17,5 +17,8 @@ swift-rs = "1.0.9"
 tauri = { version = "2.8", features = [] }
 embeddinggemma_core = { git = "https://github.com/ikcore/ai-embeddinggemma-2", rev = "2369ca8eeebee30785b7a6eff1ab7968e5a56404", default-features = true, features = ["metal"] }
 
+[patch.crates-io]
+hf-hub = { path = "vendor/hf-hub" }
+
 [profile.dev.package."*"]
 opt-level = 2

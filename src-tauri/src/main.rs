@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tauri::{AppHandle, Manager, State};
 
@@ -24,10 +27,14 @@ swift!(fn shiguang_photos_status() -> SRString);
 swift!(fn shiguang_photos_request_authorization() -> SRString);
 swift!(fn shiguang_photos_list(offset: Int, limit: Int, favorites: Int) -> SRString);
 swift!(fn shiguang_photo_thumbnail(id: &SRString) -> SRString);
+swift!(fn shiguang_photo_image(id: &SRString) -> SRString);
+swift!(fn shiguang_photo_embedding_image(id: &SRString) -> SRString);
 swift!(fn shiguang_photos_delete(ids: &SRString) -> SRString);
 swift!(fn shiguang_usb_list(offset: Int, limit: Int) -> SRString);
 swift!(fn shiguang_usb_status() -> SRString);
 swift!(fn shiguang_usb_thumbnail(id: &SRString) -> SRString);
+swift!(fn shiguang_usb_image(id: &SRString) -> SRString);
+swift!(fn shiguang_usb_embedding_image(id: &SRString) -> SRString);
 swift!(fn shiguang_usb_delete(ids: &SRString) -> SRString);
 
 #[derive(Clone)]
@@ -37,6 +44,9 @@ struct AppState {
     model_init: Arc<Mutex<()>>,
     model_state: Arc<Mutex<String>>,
     scan_state: Arc<Mutex<ScanProgress>>,
+    index_state: Arc<Mutex<IndexProgress>>,
+    index_cancel: Arc<AtomicBool>,
+    task_active: Arc<AtomicBool>,
 }
 
 #[derive(Default, Clone, Serialize)]
@@ -46,6 +56,30 @@ struct ScanProgress {
     completed: usize,
     total: usize,
     message: String,
+}
+
+#[derive(Default, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexProgress {
+    running: bool,
+    stage: String,
+    completed: usize,
+    total: usize,
+    failed: usize,
+    message: String,
+    start_date: String,
+    end_date: String,
+    source: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexInput {
+    start_date: String,
+    end_date: String,
+    start_at: String,
+    end_before: String,
+    source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,11 +140,14 @@ struct ReviewInput {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SearchInput {
     query: String,
     limit: usize,
     #[serde(default = "default_search_source")]
     source: String,
+    #[serde(default)]
+    include_weak: bool,
 }
 
 fn default_search_source() -> String {
@@ -215,16 +252,36 @@ fn asset_thumbnail(id: &str, source: &str) -> Result<Option<String>, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn wait_for_thumbnail(id: &str, source: &str) -> Result<Option<String>, String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+fn asset_image_data_url(id: &str, source: &str, for_embedding: bool) -> Result<Option<String>, String> {
+    let id = SRString::from(id);
+    let result = unsafe {
+        match (source, for_embedding) {
+            ("usb", true) => native_string(shiguang_usb_embedding_image(&id)),
+            ("usb", false) => native_string(shiguang_usb_image(&id)),
+            (_, true) => native_string(shiguang_photo_embedding_image(&id)),
+            (_, false) => native_string(shiguang_photo_image(&id)),
+        }
+    };
+    if result.is_empty() { return Ok(None); }
+    if let Some(error) = result.strip_prefix("ERR:") { return Err(error.to_owned()); }
+    Ok(Some(result))
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_image_data_url(
+    id: &str,
+    source: &str,
+    for_embedding: bool,
+    cancelled: impl Fn() -> bool,
+) -> Result<Option<String>, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
     loop {
-        if let Some(data) = asset_thumbnail(id, source)? {
-            return Ok(Some(data));
-        }
+        if cancelled() { return Ok(None); }
+        if let Some(data) = asset_image_data_url(id, source, for_embedding)? { return Ok(Some(data)); }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("等待「{id}」的照片缩略图超时；已有扫描结果未更改"));
+            return Err(format!("读取「{id}」的原图超时，请检查图库或 iPhone 连接状态"));
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::thread::sleep(std::time::Duration::from_millis(150));
     }
 }
 
@@ -234,9 +291,10 @@ fn asset_thumbnail(_id: &str, _source: &str) -> Result<Option<String>, String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn wait_for_thumbnail(_id: &str, _source: &str) -> Result<Option<String>, String> {
-    Ok(None)
-}
+fn asset_image_data_url(_id: &str, _source: &str, _for_embedding: bool) -> Result<Option<String>, String> { Ok(None) }
+
+#[cfg(not(target_os = "macos"))]
+fn wait_for_image_data_url(_id: &str, _source: &str, _for_embedding: bool, _cancelled: impl Fn() -> bool) -> Result<Option<String>, String> { Ok(None) }
 
 fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
@@ -265,13 +323,19 @@ fn ensure_model(app: &AppHandle, state: &AppState) -> Result<Arc<Embedder>, Stri
     *state.model_state.lock().map_err(|e| e.to_string())? = "downloading".into();
     let loaded = (|| -> Result<Arc<Embedder>, String> {
         let dir = model_dir(app)?;
-        unsafe { std::env::set_var("HF_HOME", &dir) };
+        unsafe {
+            std::env::set_var("HF_HOME", &dir);
+            std::env::set_var("HF_ENDPOINT", "https://hf-mirror.com");
+        }
         let options = EmbedderOptions {
             device: DeviceRequest::Auto,
             modalities: Some(embeddinggemma_core::Modalities {
                 image: true,
                 audio: false,
             }),
+            // DigUp indexes regular photos at 140 vision soft tokens.
+            // ImageIO preprocessing preserves orientation and aspect ratio at 1024 px.
+            image_soft_tokens: Some(140),
             ..Default::default()
         };
         let loaded = Embedder::load_from("440m", &dir, options)
@@ -345,6 +409,212 @@ fn sync_metadata(db: &Connection, assets: &[Asset]) -> Result<(), String> {
             rusqlite::params![format!("{}:{}",a.source,a.id),a.source,a.name,a.date,a.width,a.height,a.favorite,a.media_type]).map_err(|e| e.to_string())?;
     }
     tx.commit().map_err(|e| e.to_string())
+}
+
+fn valid_calendar_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-'
+        || !bytes.iter().enumerate().all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let Some((year, month, day)) = value.split_once('-').and_then(|(year, rest)| {
+        rest.split_once('-').and_then(|(month, day)| {
+            Some((year.parse::<i32>().ok()?, month.parse::<u32>().ok()?, day.parse::<u32>().ok()?))
+        })
+    }) else { return false; };
+    if value.len() != 10 || !(1..=12).contains(&month) || year < 1 { return false; }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    (1..=days).contains(&day)
+}
+
+fn valid_utc_timestamp(value: &str) -> bool {
+    if value.len() != 20 || !value.ends_with('Z') { return false; }
+    let date = &value[..10];
+    let time = &value[11..19];
+    valid_calendar_date(date)
+        && value.as_bytes()[10] == b'T'
+        && time.as_bytes().get(2) == Some(&b':')
+        && time.as_bytes().get(5) == Some(&b':')
+        && time.as_bytes().iter().enumerate().all(|(index, byte)| index == 2 || index == 5 || byte.is_ascii_digit())
+        && time[0..2].parse::<u32>().is_ok_and(|hour| hour < 24)
+        && time[3..5].parse::<u32>().is_ok_and(|minute| minute < 60)
+        && time[6..8].parse::<u32>().is_ok_and(|second| second < 60)
+}
+
+fn set_index_progress(state: &AppState, update: impl FnOnce(&mut IndexProgress)) {
+    if let Ok(mut progress) = state.index_state.lock() { update(&mut progress); }
+}
+
+fn collect_index_assets(source: &str, cancelled: impl Fn() -> bool) -> Result<Option<Vec<Asset>>, String> {
+    let mut assets = Vec::new();
+    if source != "usb" {
+        let status = photos_authorization()?;
+        if matches!(status.get("status").and_then(Value::as_str), Some("authorized" | "limited")) {
+            let total = status.get("count").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let mut offset = 0;
+            while offset < total {
+                if cancelled() { return Ok(None); }
+                let page = photos_page(offset, 200, false)?;
+                let batch = parse_native_assets(&page);
+                if batch.is_empty() { break; }
+                offset += batch.len();
+                assets.extend(batch);
+            }
+        } else if source == "photos" {
+            return Err("请先允许拾光访问 macOS 照片图库".into());
+        }
+    }
+    if source != "photos" {
+        let first = usb_page_range(0, 200)?;
+        let status = first.get("status").and_then(Value::as_str).unwrap_or("disconnected");
+        if status == "connected" {
+            let total = first.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let mut batch = parse_native_assets(&first);
+            let mut offset = batch.len();
+            assets.append(&mut batch);
+            while offset < total {
+                if cancelled() { return Ok(None); }
+                let page = usb_page_range(offset, 200)?;
+                let mut batch = parse_native_assets(&page);
+                if batch.is_empty() { break; }
+                offset += batch.len();
+                assets.append(&mut batch);
+            }
+        } else if source == "usb" {
+            return Err(first.get("error").and_then(Value::as_str).unwrap_or("请连接并解锁 iPhone").to_owned());
+        }
+    }
+    Ok(Some(assets))
+}
+
+#[tauri::command]
+async fn load_original_image(id: String, source: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || wait_for_image_data_url(&id, &source, false, || false))
+        .await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn index_progress(state: State<'_, AppState>) -> Result<IndexProgress, String> {
+    state.index_state.lock().map_err(|e| e.to_string()).map(|v| v.clone())
+}
+
+#[tauri::command]
+async fn stop_indexing(state: State<'_, AppState>) -> Result<(), String> {
+    state.index_cancel.store(true, Ordering::Release);
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_indexing(app: AppHandle, state: State<'_, AppState>, input: IndexInput) -> Result<Value, String> {
+    let state = state.inner().clone();
+    let start_date = input.start_date.trim().to_owned();
+    let end_date = input.end_date.trim().to_owned();
+    let source = match input.source.as_str() { "photos" | "usb" => input.source, _ => "all".into() };
+    if !valid_calendar_date(&start_date) || !valid_calendar_date(&end_date) || start_date > end_date {
+        return Err("请选择有效的日期范围，开始日期不能晚于结束日期".into());
+    }
+    let start_at = input.start_at.trim().to_owned();
+    let end_before = input.end_before.trim().to_owned();
+    if !valid_utc_timestamp(&start_at) || !valid_utc_timestamp(&end_before) || start_at >= end_before {
+        return Err("日期范围无效，请重新选择日期".into());
+    }
+    if state.task_active.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return Err("已有扫描或索引任务正在运行，请等待完成".into());
+    }
+    state.index_cancel.store(false, Ordering::Release);
+    set_index_progress(&state, |progress| *progress = IndexProgress {
+        running: true, stage: "preparing".into(), completed: 0, total: 0, failed: 0,
+        message: "正在同步照片信息…".into(), start_date: start_date.clone(), end_date: end_date.clone(), source: source.clone(),
+    });
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = (|| -> Result<Value, String> {
+            let Some(assets) = collect_index_assets(&source, || state.index_cancel.load(Ordering::Acquire))? else {
+                set_index_progress(&state, |progress| { progress.running = false; progress.stage = "cancelled".into(); progress.message = "索引已停止".into(); });
+                return Ok(json!({"indexed":0,"failed":0,"cancelled":true}));
+            };
+            sync_metadata(&*state.db.lock().map_err(|e| e.to_string())?, &assets)?;
+            if state.index_cancel.load(Ordering::Acquire) {
+                set_index_progress(&state, |progress| { progress.running = false; progress.stage = "cancelled".into(); progress.message = "索引已停止".into(); });
+                return Ok(json!({"indexed":0,"failed":0,"cancelled":true}));
+            }
+            let pending = store::assets_for_index(&*state.db.lock().map_err(|e| e.to_string())?, &source, &start_at, &end_before)?;
+            let total = pending.len();
+            set_index_progress(&state, |progress| {
+                progress.running = total != 0;
+                progress.stage = if total == 0 { "done" } else { "embedding" }.into();
+                progress.total = total;
+                progress.message = if total == 0 { "所选日期范围内没有待建立索引的原图".into() } else { format!("正在读取原图并建立索引，共 {total} 张") };
+            });
+            if total == 0 { return Ok(json!({"indexed":0,"failed":0})); }
+            if state.index_cancel.load(Ordering::Acquire) {
+                set_index_progress(&state, |progress| { progress.running = false; progress.stage = "cancelled".into(); progress.message = "索引已停止".into(); });
+                return Ok(json!({"indexed":0,"failed":0,"cancelled":true}));
+            }
+            set_index_progress(&state, |progress| { progress.stage = "model".into(); progress.message = "正在加载本地图片向量模型…".into(); });
+            let model = ensure_model(&app, &state)?;
+            let mut completed = 0usize;
+            let mut failed = 0usize;
+            for chunk in pending.chunks(4) {
+                if state.index_cancel.load(Ordering::Acquire) { break; }
+                let mut contents = Vec::new();
+                let mut accepted = Vec::new();
+                for asset in chunk {
+                    if state.index_cancel.load(Ordering::Acquire) { break; }
+                    match wait_for_image_data_url(&asset.id, &asset.source, true, || state.index_cancel.load(Ordering::Acquire)) {
+                        Ok(Some(data)) => match base64::engine::general_purpose::STANDARD.decode(data.split_once(',').map_or(data.as_str(), |(_, bytes)| bytes)) {
+                            Ok(bytes) => {
+                                contents.push(Content::Image { data: bytes.into(), format: Some("image/jpeg".into()) });
+                                accepted.push(asset.clone());
+                            }
+                            Err(_) => { failed += 1; completed += 1; }
+                        },
+                        Ok(None) if state.index_cancel.load(Ordering::Acquire) => break,
+                        Ok(None) | Err(_) => { failed += 1; completed += 1; }
+                    }
+                }
+                if state.index_cancel.load(Ordering::Acquire) { break; }
+                if !contents.is_empty() {
+                    match model.embed_contents(&ContentEmbeddingsRequest { input: OneOrMany::Many(contents), ..Default::default() }) {
+                        Ok(result) => {
+                            let db = state.db.lock().map_err(|e| e.to_string())?;
+                            for (asset, vector) in accepted.into_iter().zip(result.output) {
+                                if store::save_embedding(&db, &asset, &vector).is_ok() { completed += 1; }
+                                else { completed += 1; failed += 1; }
+                            }
+                        }
+                        Err(_) => { failed += accepted.len(); completed += accepted.len(); }
+                    }
+                }
+                set_index_progress(&state, |progress| {
+                    progress.completed = completed.min(total);
+                    progress.failed = failed;
+                    progress.message = format!("已处理 {} / {total} 张，失败 {failed} 张", completed.min(total));
+                });
+            }
+            let cancelled = state.index_cancel.load(Ordering::Acquire);
+            set_index_progress(&state, |progress| {
+                progress.running = false;
+                progress.completed = completed.min(total);
+                progress.failed = failed;
+                progress.stage = if cancelled { "cancelled" } else if failed > 0 { "done_with_errors" } else { "done" }.into();
+                progress.message = if cancelled { format!("索引已停止，完成 {} / {total} 张", completed.min(total)) }
+                    else { format!("索引完成，成功 {} 张，失败 {failed} 张", completed.saturating_sub(failed)) };
+            });
+            Ok(json!({"indexed":completed.saturating_sub(failed),"failed":failed,"cancelled":cancelled}))
+        })();
+        if let Err(error) = &result {
+            set_index_progress(&state, |progress| { progress.running = false; progress.stage = "error".into(); progress.message = format!("索引失败：{error}"); });
+        }
+        state.task_active.store(false, Ordering::Release);
+        result
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -531,11 +801,11 @@ async fn scan_rule(
 ) -> Result<Value, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        if state.task_active.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return Err("已有扫描或索引任务正在运行，请等待完成".into());
+        }
         {
             let mut progress = state.scan_state.lock().map_err(|e| e.to_string())?;
-            if progress.running {
-                return Err("已有扫描正在运行，请等待完成".into());
-            }
             *progress = ScanProgress {
                 running: true,
                 stage: "preparing".into(),
@@ -644,29 +914,31 @@ async fn scan_rule(
             sync_metadata(&*state.db.lock().map_err(|e| e.to_string())?, &all)?;
             let mut rule_matches = Vec::new();
             for chunk in all.chunks(4) {
-                let mut contents = Vec::new();
-                let mut accepted = Vec::new();
                 let mut vectors = Vec::new();
+                let mut contents = Vec::new();
+                let mut missing = Vec::new();
                 for asset in chunk {
                     let cached = store::cached_embedding(
                         &*state.db.lock().map_err(|e| e.to_string())?,
                         asset,
                     )?;
                     if let Some(vector) = cached {
-                        vectors.push((asset.clone(), vector, false));
+                        vectors.push((asset.clone(), vector));
                         continue;
                     }
-                    let Some(data) = wait_for_thumbnail(&asset.id, &asset.source)? else {
-                        continue;
-                    };
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(data)
-                        .map_err(|e| e.to_string())?;
-                    contents.push(Content::Image {
-                        data: bytes.into(),
-                        format: Some("image/jpeg".into()),
-                    });
-                    accepted.push(asset.clone());
+                    match wait_for_image_data_url(&asset.id, &asset.source, true, || false)? {
+                        Some(data) => {
+                            let bytes = base64::engine::general_purpose::STANDARD
+                                .decode(data.split_once(',').map_or(data.as_str(), |(_, bytes)| bytes))
+                                .map_err(|error| error.to_string())?;
+                            contents.push(Content::Image {
+                                data: bytes.into(),
+                                format: Some("image/jpeg".into()),
+                            });
+                            missing.push(asset.clone());
+                        }
+                        None => {}
+                    }
                 }
                 if !contents.is_empty() {
                     let computed = model
@@ -674,26 +946,20 @@ async fn scan_rule(
                             input: OneOrMany::Many(contents),
                             ..Default::default()
                         })
-                        .map_err(|e| e.to_string())?
+                        .map_err(|error| error.to_string())?
                         .output;
-                    vectors.extend(
-                        accepted
-                            .into_iter()
-                            .zip(computed)
-                            .map(|(asset, vector)| (asset, vector, true)),
-                    );
+                    let db = state.db.lock().map_err(|e| e.to_string())?;
+                    for (asset, vector) in missing.into_iter().zip(computed) {
+                        store::save_embedding(&db, &asset, &vector).map_err(|error| error.to_string())?;
+                        vectors.push((asset, vector));
+                    }
                 }
                 {
-                    let db = state.db.lock().map_err(|e| e.to_string())?;
-                    for (asset, vector, needs_save) in vectors {
+                    for (asset, vector) in vectors {
                         let score = cosine(&positive, &vector)
                             - negative
                                 .as_ref()
                                 .map_or(0.0, |n| cosine(n, &vector).max(0.0) * 0.5);
-                        if needs_save {
-                            store::save_embedding(&db, &asset, &vector)
-                                .map_err(|e| e.to_string())?;
-                        }
                         rule_matches.push((asset, score));
                     }
                 }
@@ -740,6 +1006,7 @@ async fn scan_rule(
                 };
             }
         }
+        state.task_active.store(false, Ordering::Release);
         result
     })
     .await
@@ -777,6 +1044,10 @@ async fn semantic_search(
     state: State<'_, AppState>,
     input: SearchInput,
 ) -> Result<Vec<Value>, String> {
+    let text = input.query.trim().to_owned();
+    if text.is_empty() || input.limit == 0 {
+        return Ok(Vec::new());
+    }
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         if store::embedding_count(&*state.db.lock().map_err(|e| e.to_string())?, &input.source)
@@ -788,7 +1059,7 @@ async fn semantic_search(
         let model = ensure_model(&app, &state)?;
         let query = model
             .embed_request(&EmbeddingsRequest {
-                input: input.query.into(),
+                input: text.clone().into(),
                 task: Some(EmbeddingTask::Query),
                 ..Default::default()
             })
@@ -798,8 +1069,10 @@ async fn semantic_search(
         store::semantic_search(
             &*state.db.lock().map_err(|e| e.to_string())?,
             &query,
+            &text,
             input.limit,
             &input.source,
+            input.include_weak,
         )
         .map_err(|e| e.to_string())
     })
@@ -950,6 +1223,9 @@ fn main() {
                 model_init: Arc::new(Mutex::new(())),
                 model_state: Arc::new(Mutex::new("not_loaded".into())),
                 scan_state: Arc::new(Mutex::new(ScanProgress::default())),
+                index_state: Arc::new(Mutex::new(IndexProgress::default())),
+                index_cancel: Arc::new(AtomicBool::new(false)),
+                task_active: Arc::new(AtomicBool::new(false)),
             });
             Ok(())
         })
@@ -961,6 +1237,10 @@ fn main() {
             list_assets,
             list_rules,
             load_thumbnail,
+            load_original_image,
+            start_indexing,
+            stop_indexing,
+            index_progress,
             save_rule,
             set_review_state,
             scan_rule,

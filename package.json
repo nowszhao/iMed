@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "test": "node --test frontend/*.test.js",
     "tauri": "tauri",
     "dev": "vite frontend --host 127.0.0.1",
     "build": "tauri build",

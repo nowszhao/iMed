@@ -2,8 +2,10 @@ use super::{Asset, ReviewInput, Rule, RuleInput};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
-const EMBEDDER_VERSION: &str = "embeddinggemma-2:440m:768:v1";
+const EMBEDDER_VERSION: &str = "embeddinggemma-2:440m:768:original-image-v2";
 const THUMBNAIL_CACHE_BUDGET_BYTES: i64 = 128 * 1024 * 1024;
+const SEARCH_Z_GATE: f64 = 2.0;
+const SEARCH_DEVIATION_FLOOR: f64 = 0.02;
 
 pub fn initialize(db: &Connection) -> rusqlite::Result<()> {
     db.execute_batch(
@@ -313,9 +315,18 @@ pub fn save_thumbnail(db: &Connection, key: &str, data: &str) -> Result<(), Stri
 pub fn semantic_search(
     db: &Connection,
     query: &[f32],
+    query_text: &str,
     limit: usize,
     source: &str,
+    include_weak: bool,
 ) -> Result<Vec<Value>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    if !valid_search_vector(query) {
+        return Err("搜索向量无效，请重试或重新加载模型".into());
+    }
+    let query_text = query_text.trim();
     let source = if source == "photos" || source == "usb" {
         source
     } else {
@@ -363,15 +374,58 @@ pub fn semantic_search(
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect::<Vec<_>>();
+        if !valid_search_vector(&vector) {
+            continue;
+        }
         let score = super::cosine(query, &vector);
-        found.push((score,json!({"id":key.split_once(':').map(|x|x.1).unwrap_or(&key),"source":source,"name":name,"date":date,"width":width,"height":height,"favorite":favorite,"reviewed":reviewed,"queued":queued,"thumbnail":thumbnail,"score":score,"key":key})));
+        if !score.is_finite() {
+            continue;
+        }
+        let exact_name = normalized_exact_name_match(&name, query_text);
+        found.push((score, exact_name, json!({"id":key.split_once(':').map(|x|x.1).unwrap_or(&key),"source":source,"name":name,"date":date,"width":width,"height":height,"favorite":favorite,"reviewed":reviewed,"queued":queued,"thumbnail":thumbnail,"score":score,"key":key})));
     }
-    found.sort_by(|a, b| b.0.total_cmp(&a.0));
+    // As in DigUp's Searcher.meaning/zGate: a nearest neighbour is not
+    // necessarily a match. Calibrate against this query's score distribution
+    // before taking top-k; never fill the limit with background results.
+    // All our vectors are images, so no per-modality centering is needed.
+    let count = found.len().max(1) as f64;
+    let mean = found.iter().map(|(score, _, _)| *score as f64).sum::<f64>() / count;
+    let variance = found
+        .iter()
+        .map(|(score, _, _)| (*score as f64 - mean).powi(2))
+        .sum::<f64>()
+        / count;
+    let deviation = variance.sqrt().max(SEARCH_DEVIATION_FLOOR);
+    for (score, exact_name, row) in &mut found {
+        let relevance = (*score as f64 - mean) / deviation;
+        row["weakMatch"] = json!(!*exact_name && (*score <= 0.0 || relevance < SEARCH_Z_GATE));
+    }
+    found.retain(|(_, _, row)| include_weak || row["weakMatch"] == false);
+    found.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| a.2["key"].as_str().cmp(&b.2["key"].as_str()))
+    });
     Ok(found
         .into_iter()
         .take(limit.clamp(1, 500))
-        .map(|(_, v)| v)
+        .map(|(_, _, v)| v)
         .collect())
+}
+
+fn normalized_exact_name_match(name: &str, query: &str) -> bool {
+    let normalize = |value: &str| {
+        value.chars()
+            .filter(|character| character.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let name = normalize(name);
+    let query = normalize(query);
+    !query.is_empty() && !name.is_empty() && name.contains(&query)
+}
+
+fn valid_search_vector(vector: &[f32]) -> bool {
+    !vector.is_empty() && vector.iter().all(|v| v.is_finite()) && vector.iter().any(|v| *v != 0.0)
 }
 
 pub fn similar_assets(
@@ -494,6 +548,45 @@ pub fn embedding_count(db: &Connection, source: &str) -> rusqlite::Result<usize>
         params![EMBEDDER_VERSION, source],
         |row| row.get::<_, i64>(0),
     ).map(|count| count as usize)
+}
+
+pub fn assets_for_index(
+    db: &Connection,
+    source: &str,
+    start_date: &str,
+    end_date_exclusive: &str,
+) -> Result<Vec<Asset>, String> {
+    let source = if source == "photos" || source == "usb" { source } else { "all" };
+    let mut stmt = db.prepare(
+        "SELECT a.asset_key,a.source,a.name,a.created_at,a.width,a.height,a.favorite,a.media_type,
+                a.thumbnail,a.review_state,a.queued,
+                (SELECT max(m.score) FROM matches m WHERE m.asset_key=a.asset_key),
+                (SELECT m.rule_id FROM matches m WHERE m.asset_key=a.asset_key ORDER BY m.score DESC LIMIT 1)
+         FROM assets a
+         WHERE a.deleted_at IS NULL AND a.media_type='image'
+           AND a.created_at>=?1 AND a.created_at<?2
+           AND (?3='all' OR a.source=?3)
+           AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.asset_key=a.asset_key AND e.model_version=?4)
+         ORDER BY a.created_at,a.asset_key",
+    ).map_err(|e| e.to_string())?;
+    stmt.query_map(params![start_date, end_date_exclusive, source, EMBEDDER_VERSION], |row| {
+        let key: String = row.get(0)?;
+        Ok(Asset {
+            id: key.split_once(':').map(|(_, id)| id).unwrap_or(&key).to_owned(),
+            source: row.get(1)?,
+            name: row.get(2)?,
+            date: row.get(3)?,
+            width: row.get(4)?,
+            height: row.get(5)?,
+            favorite: row.get(6)?,
+            media_type: row.get(7)?,
+            thumbnail: row.get(8)?,
+            reviewed: row.get(9)?,
+            queued: row.get::<_, i64>(10)? != 0,
+            score: row.get(11)?,
+            rule_id: row.get(12)?,
+        })
+    }).map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
 }
 
 pub fn list_queued(
@@ -669,4 +762,173 @@ pub fn mark_deleted(db: &Connection, ids: &[String]) -> rusqlite::Result<()> {
         tx.execute("UPDATE assets SET queued=0,review_state='deleted',deleted_at=CURRENT_TIMESTAMP WHERE asset_key=?1 AND queued=1",[id])?;
     }
     tx.commit()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn indexed_photo(db: &Connection, id: &str, score: f32) {
+        let asset = Asset {
+            id: id.into(),
+            source: "photos".into(),
+            name: format!("{id}.jpg"),
+            date: String::new(),
+            width: 800,
+            height: 600,
+            favorite: false,
+            media_type: "image".into(),
+            thumbnail: None,
+            score: None,
+            reviewed: "pending".into(),
+            queued: false,
+            rule_id: None,
+        };
+        // Controlled cosine scores isolate retrieval from model inference.
+        save_embedding(db, &asset, &[score, (1.0 - score * score).sqrt()]).unwrap();
+    }
+
+    #[test]
+    fn semantic_search_excludes_unrelated_photos_for_hair_query() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        for i in 0..30 {
+            indexed_photo(
+                &db,
+                &format!("background-{i}"),
+                0.45 + (i % 5) as f32 * 0.01,
+            );
+        }
+        indexed_photo(&db, "hair", 0.80);
+        let results = semantic_search(&db, &[1.0, 0.0], "hair", 120, "all", false).unwrap();
+        let ids: Vec<_> = results.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            ["hair"],
+            "search must not fill the result limit with unrelated photos"
+        );
+    }
+
+    #[test]
+    fn semantic_search_returns_empty_when_nothing_stands_out() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        for i in 0..30 {
+            indexed_photo(
+                &db,
+                &format!("background-{i}"),
+                0.45 + (i % 5) as f32 * 0.01,
+            );
+        }
+        assert!(
+            semantic_search(&db, &[1.0, 0.0], "unrelated", 120, "all", false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn semantic_search_can_expand_small_or_uniform_libraries() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        indexed_photo(&db, "hair", 0.80);
+        assert!(
+            semantic_search(&db, &[1.0, 0.0], "hair", 120, "all", false)
+                .unwrap()
+                .is_empty()
+        );
+        let results = semantic_search(&db, &[1.0, 0.0], "hair", 120, "all", true).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["id"], "hair");
+        assert_eq!(results[0]["weakMatch"], true);
+    }
+
+    #[test]
+    fn semantic_search_does_not_amplify_tiny_score_differences() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        for i in 0..30 {
+            indexed_photo(&db, &format!("background-{i}"), 0.50);
+        }
+        indexed_photo(&db, "noise", 0.501);
+        assert!(
+            semantic_search(&db, &[1.0, 0.0], "noise", 120, "all", false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn semantic_search_filters_before_limiting_and_preserves_raw_scores() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        for i in 0..30 {
+            indexed_photo(&db, &format!("background-{i}"), 0.45);
+        }
+        indexed_photo(&db, "hair", 0.80);
+        indexed_photo(&db, "hair-2", 0.75);
+        let results = semantic_search(&db, &[1.0, 0.0], "hair", 1, "all", false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["id"], "hair");
+        assert_eq!(results[0]["weakMatch"], false);
+        assert!((results[0]["score"].as_f64().unwrap() - 0.80).abs() < 1e-6);
+        assert!(
+            semantic_search(&db, &[1.0, 0.0], "hair", 0, "all", true)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn semantic_search_excludes_invalid_deleted_and_other_source_vectors() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        for id in [
+            "hair",
+            "deleted",
+            "usb",
+            "nan",
+            "zero",
+            "dimensions",
+            "old-model",
+        ] {
+            indexed_photo(&db, id, 0.80);
+        }
+        db.execute(
+            "UPDATE assets SET deleted_at=CURRENT_TIMESTAMP WHERE name='deleted.jpg'",
+            [],
+        )
+        .unwrap();
+        db.execute("UPDATE assets SET source='usb' WHERE name='usb.jpg'", [])
+            .unwrap();
+        for (id, vector) in [("nan", [f32::NAN, 1.0]), ("zero", [0.0, 0.0])] {
+            let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
+            db.execute(
+                "UPDATE embeddings SET vector=?1 WHERE asset_key=?2",
+                params![bytes, format!("photos:{id}")],
+            )
+            .unwrap();
+        }
+        db.execute(
+            "UPDATE embeddings SET dimensions=3 WHERE asset_key='photos:dimensions'",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE embeddings SET model_version='obsolete' WHERE asset_key='photos:old-model'",
+            [],
+        )
+        .unwrap();
+        let results = semantic_search(&db, &[1.0, 0.0], "hair", 120, "photos", true).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["id"], "hair");
+        for query in [
+            &[][..],
+            &[0.0, 0.0],
+            &[f32::NAN, 1.0],
+            &[f32::INFINITY, 1.0],
+        ] {
+            assert!(semantic_search(&db, query, "hair", 120, "all", false).is_err());
+        }
+    }
 }

@@ -13,6 +13,28 @@
     .is-hidden{display:none!important}
     .similar-action{width:100%;height:32px;margin-top:9px;border:1px solid #e5e8e1;border-radius:6px;background:#fff;color:#64745f;font-size:10px;font-weight:550}
     .similar-action:hover{background:#f1f4ef;border-color:#dce3d8}
+    .index-controls{display:flex;align-items:center;gap:8px;margin-top:15px;padding:11px 12px;border:1px solid #e9ebe5;border-radius:8px;background:#fbfcf9}
+    .index-controls label{display:flex;align-items:center;gap:6px;font-size:9.5px;color:#81847c;white-space:nowrap}
+    .index-controls input,.index-controls select{height:29px;min-width:0;border:1px solid #e4e6df;border-radius:5px;background:#fff;padding:0 7px;color:#555950;font-size:9.5px}
+    .index-controls input{width:132px}
+    .index-controls select{width:125px}
+    .index-controls .subtle-btn{height:29px;white-space:nowrap}
+    .index-progress{display:none;margin-top:9px;padding:10px 12px;border:1px solid #e9e4d8;border-radius:7px;background:#fffdf7;color:#797469;font-size:10px}
+    .index-progress.show{display:block}
+    .index-progress-top{display:flex;align-items:center;gap:10px}
+    .index-progress-top span{flex:1}
+    .index-progress .progress{flex:1;min-width:80px;margin:0}
+    .index-progress button{border:1px solid #e4e5de;border-radius:5px;background:#fff;padding:5px 9px;font-size:9.5px;color:#696c65}
+    .original-modal{width:min(1120px,calc(100vw - 48px));height:min(820px,calc(100vh - 48px));display:flex;flex-direction:column;padding:13px}
+    .original-head{display:flex;align-items:center;gap:12px;padding:1px 2px 11px;color:#555950;font-size:10px}
+    .original-head strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:550}
+    .original-head button{margin-left:auto;width:28px;height:28px;border:0;border-radius:6px;background:#f0f1ed;font-size:17px;color:#666960}
+    .original-view{display:grid;place-items:center;min-height:0;flex:1;overflow:auto;border-radius:7px;background:#171a17}
+    .original-view img{display:block;max-width:100%;max-height:100%;object-fit:contain}
+    .original-loading{padding:25px;color:#f0f1ed;font-size:11px}
+    .view-original{width:100%;height:32px;margin-top:9px;border:1px solid #e5e8e1;border-radius:6px;background:#fff;color:#64745f;font-size:10px;font-weight:550}
+    .view-original:hover{background:#f1f4ef;border-color:#dce3d8}
+    @media(max-width:1200px){.index-controls{flex-wrap:wrap}.index-controls input{width:120px}}
   </style>
 </head>
 <body>
@@ -47,8 +69,10 @@
     <main class="main"><div class="main-inner">
       <div class="eyebrow"><span id="crumbCategory">整理</span><span class="slash">/</span><span id="crumbSection">清理建议</span><span class="slash">/</span><span class="current" id="crumb">严重模糊</span></div>
       <div class="heading-row"><div class="heading"><h1 id="pageTitle">清理建议</h1><div class="subheading" id="subheading">允许访问本机图库后，即可建立索引并运行本地扫描。</div></div><div class="heading-actions"><button class="subtle-btn" id="rulesBtn"><svg viewBox="0 0 20 20" fill="none"><path d="M3 5h14M6 10h8m-5 5h2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="7" cy="5" r="1.4" fill="#fff" stroke="currentColor" stroke-width="1.3"/><circle cx="12" cy="10" r="1.4" fill="#fff" stroke="currentColor" stroke-width="1.3"/></svg>编辑规则</button><button class="subtle-btn" id="refreshBtn"><svg viewBox="0 0 20 20" fill="none"><path d="M16.2 8A6.5 6.5 0 0 0 5 5.1L3.5 6.6M3.8 4v2.8h2.8M3.8 12a6.5 6.5 0 0 0 11.2 2.9l1.5-1.5M16.2 16v-2.8h-2.8" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/></svg>重新扫描</button></div></div>
+      <div class="index-controls"><label>从 <input type="date" id="indexStartDate" aria-label="索引开始日期"></label><label>到 <input type="date" id="indexEndDate" aria-label="索引结束日期"></label><label>来源 <select id="indexSource"><option value="all">所有来源</option><option value="photos">Mac 照片图库</option><option value="usb">USB iPhone</option></select></label><button class="subtle-btn" id="startIndexBtn">创建原图索引</button></div>
+      <div class="index-progress" id="indexProgress"><div class="index-progress-top"><span id="indexProgressText"></span><div class="progress"><i id="indexProgressFill"></i></div><button id="stopIndexBtn">停止</button></div></div>
       <div class="banner" id="progressBanner"><span id="progressText"></span><div class="progress"><i id="progressFill"></i></div></div>
-      <div class="tabs-row"><div class="tabs"><button class="tab active" data-tab="all">全部<span class="tab-count" id="tabAll">0</span></button><button class="tab" data-tab="unreviewed">待复核<span class="tab-count" id="tabPending">0</span></button><button class="tab" data-tab="later">稍后看<span class="tab-count" id="tabLater">0</span></button></div><div class="filters"><button class="filter" id="dateFilter">拍摄时间 <svg viewBox="0 0 12 12" fill="none"><path d="m3 4.5 3 3 3-3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button><button class="filter" id="sortFilter">拍摄时间 ↓ <svg viewBox="0 0 12 12" fill="none"><path d="m3 4.5 3 3 3-3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div></div>
+      <div class="tabs-row"><div class="tabs"><button class="tab active" data-tab="all">全部<span class="tab-count" id="tabAll">0</span></button><button class="tab" data-tab="unreviewed">待复核<span class="tab-count" id="tabPending">0</span></button><button class="tab" data-tab="later">稍后看<span class="tab-count" id="tabLater">0</span></button></div><div class="filters"><button class="filter is-hidden" id="weakResults" aria-pressed="false">包含较弱结果</button><button class="filter" id="dateFilter">拍摄时间 <svg viewBox="0 0 12 12" fill="none"><path d="m3 4.5 3 3 3-3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button><button class="filter" id="sortFilter">拍摄时间 ↓ <svg viewBox="0 0 12 12" fill="none"><path d="m3 4.5 3 3 3-3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div></div>
       <section class="photo-grid" id="photoGrid" aria-label="照片候选"></section>
       <div class="load-more"><button id="loadMore">加载更多　↓</button></div>
     </div></main>
@@ -61,6 +85,7 @@
 <div class="modal-backdrop" id="ruleModal" role="dialog" aria-modal="true" aria-labelledby="ruleTitle"><div class="modal"><h2 id="ruleTitle">创建扫描规则</h2><p id="ruleDescription">用自然语言描述要查找的照片。匹配度只用于排序；扫描结果会进入待复核队列，不会自动删除。</p><label class="prompt-label" for="ruleName">规则名称</label><input class="prompt-input" id="ruleName" placeholder="例如：严重失焦"><label class="prompt-label" for="rulePrompt">查找描述</label><textarea class="prompt-input" id="rulePrompt" rows="3" placeholder="描述你想找的照片，例如：因手抖导致主体完全模糊、看不清细节的照片"></textarea><label class="prompt-label" for="ruleExclude">排除描述（可选）</label><textarea class="prompt-input" id="ruleExclude" rows="2" placeholder="例如：有意拍摄的动态模糊或柔焦效果"></textarea><div class="prompt-label">匹配门槛</div><div class="range-row"><input id="ruleThreshold" type="range" min="0.15" max="0.75" step="0.01" value="0.34"><span class="range-value" id="thresholdValue">0.34</span></div><div class="modal-footer"><button class="modal-cancel" id="cancelRule">取消</button><button class="modal-save" id="saveRule">保存并扫描</button></div></div></div>
 <div class="modal-backdrop" id="deleteModal" role="dialog" aria-modal="true" aria-labelledby="deleteTitle"><div class="modal"><h2 id="deleteTitle">确认从照片图库删除？</h2><p id="deleteDescription">选中的照片将由 macOS 照片图库或已连接设备处理。</p><ul class="confirm-list" id="deleteList"></ul><div class="modal-footer"><button class="modal-cancel" id="cancelDelete">返回复核</button><button class="modal-save danger" id="confirmDelete">确认删除</button></div></div></div>
 <div class="modal-backdrop" id="sourceModal" role="dialog" aria-modal="true" aria-labelledby="sourceTitle"><div class="modal"><h2 id="sourceTitle">连接照片来源</h2><p>选择“允许访问图库”后，macOS 会显示系统授权提示。拾光只读取照片用于本地索引和整理。</p><div class="rule-hit"><div class="hit-top">Mac 照片图库 <span class="hit-score" id="photosAccessLabel">检查中</span></div><div class="hit-reason" id="photosAccessHint">用于浏览和索引本机照片；授权范围由 macOS 管理。</div></div><div class="rule-hit" style="margin-top:8px"><div class="hit-top">USB 连接设备 <span class="hit-score" id="usbAccessLabel">未连接</span></div><div class="hit-reason" id="usbAccessHint">连接 iPhone，解锁屏幕，并在系统提示时选择“信任”。仅展示系统可读取的照片媒体。</div></div><div class="modal-footer"><button class="modal-cancel" id="closeSource">关闭</button><button class="modal-save" id="refreshSources">允许访问图库</button></div></div></div>
+<div class="modal-backdrop" id="originalModal" role="dialog" aria-modal="true" aria-label="高清原图"><div class="modal original-modal"><div class="original-head"><strong id="originalTitle">高清原图</strong><button id="closeOriginal" aria-label="关闭原图">×</button></div><div class="original-view" id="originalView"><span class="original-loading">正在读取原图…</span></div></div></div>
 <script type="module" src="/src.js"></script>
 </body>
 </html>

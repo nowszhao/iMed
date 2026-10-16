@@ -1,5 +1,7 @@
 import AppKit
+import CoreGraphics
 import Foundation
+import ImageIO
 import ImageCaptureCore
 import Photos
 import SwiftRs
@@ -22,6 +24,8 @@ private enum NativeAsyncCache {
     static var photoThumbnailSizes: [String: Int] = [:]
     static var photoThumbnailAccess: [String: UInt64] = [:]
     static var photoThumbnailPending = Set<String>()
+    static var photoImages: [String: String] = [:]
+    static var photoImagePending = Set<String>()
     static var photoDeleteResults: [String: String] = [:]
     static var photoDeletePending = Set<String>()
 }
@@ -88,6 +92,75 @@ public func shiguangPhotosList(_ offset: Int, _ limit: Int, _ favorites: Int) ->
 private func jpegThumbnail(_ image: NSImage, quality: CGFloat = 0.82) -> Data? {
     guard let tiff = image.tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiff) else { return nil }
     return bitmap.representation(using: .jpeg, properties: [.compressionFactor: quality])
+}
+
+private func imageDataURL(_ data: Data, uniformTypeIdentifier: String?) -> String {
+    let mime = uniformTypeIdentifier.flatMap { UTType($0)?.preferredMIMEType } ?? "application/octet-stream"
+    return "data:\(mime);base64,\(data.base64EncodedString())"
+}
+
+// ImageIO decodes the original asset at a useful model input size while preserving
+// EXIF orientation and aspect ratio. DigUp prepares regular photos at 1024 px
+// before embedding them with its 140-token photo budget.
+private func embeddingJPEG(_ original: Data, maxDimension: Int = 1024) -> Data? {
+    guard let source = CGImageSourceCreateWithData(original as CFData, nil) else { return nil }
+    let options: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxDimension,
+        kCGImageSourceShouldCacheImmediately: true,
+    ]
+    guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+    let output = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(output, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
+    CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 0.97] as CFDictionary)
+    guard CGImageDestinationFinalize(destination) else { return nil }
+    return output as Data
+}
+
+private func requestPhotoImage(_ asset: PHAsset, forEmbedding: Bool = false) -> String {
+    let key = asset.localIdentifier + (forEmbedding ? ":embedding" : ":original")
+    NativeAsyncCache.lock.lock()
+    if let result = NativeAsyncCache.photoImages.removeValue(forKey: key) {
+        NativeAsyncCache.lock.unlock()
+        return result
+    }
+    let shouldRequest = !NativeAsyncCache.photoImagePending.contains(key)
+    if shouldRequest { NativeAsyncCache.photoImagePending.insert(key) }
+    NativeAsyncCache.lock.unlock()
+    guard shouldRequest else { return "" }
+
+    let resources = PHAssetResource.assetResources(for: asset)
+    guard let resource = resources.first(where: { $0.type == .fullSizePhoto })
+        ?? resources.first(where: { $0.type == .photo }) else {
+        NativeAsyncCache.lock.lock()
+        NativeAsyncCache.photoImages[key] = "ERR:照片原始资源不可用"
+        NativeAsyncCache.photoImagePending.remove(key)
+        NativeAsyncCache.lock.unlock()
+        return ""
+    }
+    let options = PHAssetResourceRequestOptions()
+    options.isNetworkAccessAllowed = true
+    var original = Data()
+    PHAssetResourceManager.default().requestData(for: resource, options: options) { chunk in
+        original.append(chunk)
+    } completionHandler: { error in
+        let result: String
+        if let error {
+            result = "ERR:" + error.localizedDescription
+        } else if forEmbedding, let jpeg = embeddingJPEG(original) {
+            result = imageDataURL(jpeg, uniformTypeIdentifier: UTType.jpeg.identifier)
+        } else if forEmbedding {
+            result = "ERR:无法解码照片原图以建立向量"
+        } else {
+            result = imageDataURL(original, uniformTypeIdentifier: resource.uniformTypeIdentifier)
+        }
+        NativeAsyncCache.lock.lock()
+        NativeAsyncCache.photoImages[key] = result
+        NativeAsyncCache.photoImagePending.remove(key)
+        NativeAsyncCache.lock.unlock()
+    }
+    return ""
 }
 
 private func requestPhotoThumbnail(_ asset: PHAsset) -> String? {
@@ -157,6 +230,24 @@ public func shiguangPhotoThumbnail(_ rawID: SRString) -> SRString {
     return SRString(requestPhotoThumbnail(asset) ?? "")
 }
 
+@_cdecl("shiguang_photo_image")
+public func shiguangPhotoImage(_ rawID: SRString) -> SRString {
+    let id = rawID.toString()
+    guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject else {
+        return SRString("ERR:照片已不在当前图库中")
+    }
+    return SRString(requestPhotoImage(asset))
+}
+
+@_cdecl("shiguang_photo_embedding_image")
+public func shiguangPhotoEmbeddingImage(_ rawID: SRString) -> SRString {
+    let id = rawID.toString()
+    guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject else {
+        return SRString("ERR:照片已不在当前图库中")
+    }
+    return SRString(requestPhotoImage(asset, forEmbedding: true))
+}
+
 private func photoDelete(_ ids: [String]) -> String {
     let key = ids.sorted().joined(separator: "\u{0}")
     NativeAsyncCache.lock.lock()
@@ -218,6 +309,8 @@ private final class USBSession: NSObject, ICDeviceBrowserDelegate, ICDeviceDeleg
     private var thumbnailSizes: [String: Int] = [:]
     private var thumbnailAccess: [String: UInt64] = [:]
     private var thumbnailPending = Set<String>()
+    private var imageResults: [String: String] = [:]
+    private var imagePending = Set<String>()
     private var deleteResults: [String: String] = [:]
     private var deletePending = Set<String>()
 
@@ -264,7 +357,7 @@ private final class USBSession: NSObject, ICDeviceBrowserDelegate, ICDeviceDeleg
 
     func deviceBrowser(_ browser: ICDeviceBrowser, didAdd device: ICDevice, moreComing: Bool) {
         guard let camera = device as? ICCameraDevice else { return }
-        guard camera.transportType == ICDeviceTransport(rawValue: "USB").rawValue else { return }
+        guard camera.transportType == ICDeviceTransport.transportTypeUSB.rawValue else { return }
         self.camera = camera
         deviceID = camera.uuidString ?? camera.name ?? "iphone"
         searching = false
@@ -408,6 +501,53 @@ private final class USBSession: NSObject, ICDeviceBrowserDelegate, ICDeviceDeleg
         return ""
     }
 
+    func image(_ identifier: String, forEmbedding: Bool = false) -> String {
+        let key = identifier + (forEmbedding ? ":embedding" : ":original")
+        snapshotLock.lock()
+        if let result = imageResults.removeValue(forKey: key) {
+            snapshotLock.unlock()
+            return result
+        }
+        let shouldRequest = !imagePending.contains(key)
+        if shouldRequest { imagePending.insert(key) }
+        snapshotLock.unlock()
+        guard shouldRequest else { return "" }
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.startOnMain()
+            guard let file = self.files[identifier] else {
+                self.finishImage(key, result: "ERR:iPhone 照片已不可用，请重新连接设备")
+                return
+            }
+            guard file.fileSize > 0 else {
+                self.finishImage(key, result: "ERR:照片原始文件为空")
+                return
+            }
+            file.requestReadData(atOffset: 0, length: file.fileSize) { data, error in
+                let result: String
+                if let data, forEmbedding, let jpeg = embeddingJPEG(data) {
+                    result = imageDataURL(jpeg, uniformTypeIdentifier: UTType.jpeg.identifier)
+                } else if let data, forEmbedding {
+                    result = "ERR:无法解码照片原图以建立向量"
+                } else if let data {
+                    result = imageDataURL(data, uniformTypeIdentifier: file.uti)
+                } else {
+                    result = "ERR:" + (error?.localizedDescription ?? "无法读取 iPhone 照片原图")
+                }
+                self.finishImage(key, result: result)
+            }
+        }
+        return ""
+    }
+
+    private func finishImage(_ key: String, result: String) {
+        snapshotLock.lock()
+        imageResults[key] = result
+        imagePending.remove(key)
+        snapshotLock.unlock()
+    }
+
     private func cacheThumbnailLocked(_ identifier: String, data: Data) {
         if let oldSize = thumbnailSizes[identifier] { thumbnailBytes -= oldSize }
         thumbnailResults[identifier] = data.base64EncodedString()
@@ -480,6 +620,16 @@ public func shiguangUSBStatus() -> SRString { SRString(USBSession.shared.status(
 
 @_cdecl("shiguang_usb_thumbnail")
 public func shiguangUSBThumbnail(_ rawID: SRString) -> SRString { SRString(USBSession.shared.thumbnail(rawID.toString())) }
+
+@_cdecl("shiguang_usb_image")
+public func shiguangUSBImage(_ rawID: SRString) -> SRString {
+    SRString(USBSession.shared.image(rawID.toString()))
+}
+
+@_cdecl("shiguang_usb_embedding_image")
+public func shiguangUSBEmbeddingImage(_ rawID: SRString) -> SRString {
+    SRString(USBSession.shared.image(rawID.toString(), forEmbedding: true))
+}
 
 @_cdecl("shiguang_usb_delete")
 public func shiguangUSBDelete(_ rawIDs: SRString) -> SRString {

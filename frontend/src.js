@@ -1,12 +1,13 @@
 import { invoke } from '@tauri-apps/api/core';
+import { bindSearchInput } from './search-input.js';
 
 const $ = (selector) => document.querySelector(selector);
 const state = {
   assets: [], rules: [], counts: { photos: 0, usb: 0, queued: 0, candidates: 0 },
   reviewCounts: { pending: 0, later: 0 },
-  page: 'cleanup', ruleId: 'blur', source: 'all', tab: 'all', query: '',
+  page: 'cleanup', ruleId: 'blur', source: 'all', tab: 'all', query: '', includeWeak: false, searchPending: false, searchError: '',
   selected: new Set(), focus: null, offset: 0, photoOffset: 0, usbOffset: 0, limit: 60, total: 0, sortAsc: false, inspectorHidden: false,
-  photoStatus: 'unknown', usbStatus: 'unknown', photoTotal: 0, usbViewTotal: 0, similarAnchor: null, searchGeneration: 0, scanTimer: null, toastTimer: null,
+  photoStatus: 'unknown', usbStatus: 'unknown', photoTotal: 0, usbViewTotal: 0, similarAnchor: null, searchGeneration: 0, scanTimer: null, indexTimer: null, indexRequest: 0, originalRequest: 0, toastTimer: null,
 };
 const labels = {
   all: ['所有照片', '图库'], recent: ['最近导入', '图库'], favorites: ['收藏', '图库'],
@@ -88,7 +89,7 @@ function setSubheading() {
     $('#subheading').innerHTML = `<strong>${state.total || 0} 张</strong>来自当前照片来源`;
   } else if (state.page === 'search') {
     $('#subheading').innerHTML = state.query
-      ? `搜索 <strong>“${escapeHtml(state.query)}”</strong> 的已索引照片`
+      ? `搜索 <strong>“${escapeHtml(state.query)}”</strong> 的已索引照片 · ${state.includeWeak ? '包含较弱相关结果' : '仅显示相关性突出的结果'}`
       : '输入场景或画面描述，在已索引照片中搜索';
   } else {
     $('#subheading').innerHTML = `<strong>${state.total || 0} 张</strong>照片`;
@@ -103,6 +104,9 @@ function decoratePage() {
   $('#crumb').textContent = state.page === 'cleanup' ? (currentRule()?.name || '扫描规则') : title;
   $('#addSelected').textContent = state.page === 'queue' ? '移出待删除' : '加入待删除';
   $('#confirmSelected').classList.toggle('is-hidden', state.page !== 'queue');
+  $('#weakResults').classList.toggle('is-hidden', state.page !== 'search');
+  $('#weakResults').setAttribute('aria-pressed', String(state.includeWeak));
+  $('#weakResults').textContent = state.includeWeak ? '仅看突出结果' : '包含较弱结果';
   setSubheading();
   document.querySelectorAll('.nav-item[data-page]').forEach(button => button.classList.toggle('active', button.dataset.page === state.page));
   document.querySelectorAll('.rule-nav').forEach(button => button.classList.toggle('active-rule', button.dataset.rule === state.ruleId));
@@ -271,14 +275,19 @@ function renderGrid() {
             : '这条规则还没有扫描结果。<br>点击右上角“扫描图库”开始本地扫描。'
       : state.page === 'queue' ? '待删除列表为空。<br>先在照片或清理建议中选择候选照片。'
         : state.page === 'similar' ? '还没有相似照片结果。<br>先打开一张已建立向量索引的照片，在详情中点击“查找相似照片”。'
-          : state.page === 'search' ? '搜索已索引照片。<br>扫描图库后即可进行自然语言语义搜索。' : '当前视图没有照片。';
+          : state.page === 'search'
+            ? state.searchPending ? '正在搜索已索引照片…'
+              : state.searchError ? `搜索暂不可用：${escapeHtml(state.searchError)}`
+                : state.includeWeak ? '当前来源没有可搜索的照片，请先扫描图库。'
+                  : '没有相关性突出的照片。<br>可补充画面描述，或点击“包含较弱结果”扩大范围；未索引的照片需要先扫描。'
+            : '当前视图没有照片。';
     grid.innerHTML = `<div class="empty-state"><div class="empty-icon">${svgImage}</div>${message}</div>`;
   } else {
     grid.innerHTML = items.map(asset => {
       const key = localSelectionId(asset);
       const selected = state.selected.has(key);
       const score = Number.isFinite(asset.score)
-        ? `${Math.round(asset.score * 100)}% ${state.page === 'similar' ? '相似' : state.page === 'search' ? '相关' : '匹配'}`
+        ? `${Math.round(asset.score * 100)}% ${state.page === 'similar' ? '相似' : state.page === 'search' ? asset.weakMatch ? '较弱相关' : '相关' : '匹配'}`
         : '';
       const dimensions = asset.width && asset.height ? `${asset.width} × ${asset.height}` : sourceName(asset.source);
       const thumb = thumbnailMarkup(asset);
@@ -322,16 +331,117 @@ function renderInspector(asset) {
   const matchTitle = similarity ? `与「${similarity.name}」相似` : semanticSearch ? '语义搜索结果' : rule?.name || '尚未匹配扫描规则';
   const matchReason = similarity
     ? '基于本地图片向量计算的相似度，仅比较已建立索引的照片。'
-    : semanticSearch ? `与“${state.query}”的语义相关度。`
+    : semanticSearch ? `与“${state.query}”的语义相关度，仅用于排序，不是识别概率。${asset.weakMatch ? '该结果未达到相关性突出门槛。' : ''}`
       : rule?.prompt || '完成规则扫描后，会显示这张照片与描述的匹配分数。';
   const scoreTitle = similarity ? '向量相似度' : semanticSearch ? '语义相关度' : '语义匹配分数';
-  $('#inspectorBody').innerHTML = `<div class="preview-wrap">${thumb}</div><div class="image-caption"><strong>${escapeHtml(formatDate(asset.date))}</strong><span>${escapeHtml(sourceName(asset.source))}</span></div><div class="detail-title">${similarity ? '相似度结果' : rule || semanticSearch ? '匹配结果' : '照片信息'}</div><div class="rule-hit"><div class="hit-top"><i class="hit-badge"></i>${escapeHtml(matchTitle)}<span class="hit-score">${score === null ? '未扫描' : `${Math.round(score * 100)}%`}</span></div><div class="hit-reason">${escapeHtml(matchReason)}</div></div>${score === null ? '' : `<div class="score-label"><span>${scoreTitle}</span><strong>${score.toFixed(3)}</strong></div><div class="score-track"><i style="width:${Math.max(0, Math.min(100, score * 100))}%"></i></div>`}<div class="metadata"><span>文件名称</span><strong title="${escapeHtml(asset.name)}">${escapeHtml(asset.name)}</strong><span>拍摄时间</span><strong>${escapeHtml(formatDate(asset.date))}</strong><span>分辨率</span><strong>${asset.width && asset.height ? `${asset.width} × ${asset.height}` : '未知'}</strong><span>来源</span><strong>${escapeHtml(sourceName(asset.source))}</strong><span>审核状态</span><strong>${asset.queued ? '待删除' : asset.reviewed === 'kept' ? '已保留' : asset.reviewed === 'later' ? '稍后复核' : '待复核'}</strong></div><div class="inspector-actions"><button class="keep-btn" id="keepOne">✓　保留</button><button class="later-btn" id="laterOne">稍后复核</button></div><button class="similar-action" id="findSimilar">⌕　查找相似照片</button>`;
+  $('#inspectorBody').innerHTML = `<div class="preview-wrap">${thumb}</div><div class="image-caption"><strong>${escapeHtml(formatDate(asset.date))}</strong><span>${escapeHtml(sourceName(asset.source))}</span></div><button class="view-original" id="viewOriginal">查看高清原图</button><div class="detail-title">${similarity ? '相似度结果' : rule || semanticSearch ? '匹配结果' : '照片信息'}</div><div class="rule-hit"><div class="hit-top"><i class="hit-badge"></i>${escapeHtml(matchTitle)}<span class="hit-score">${score === null ? '未扫描' : `${Math.round(score * 100)}%`}</span></div><div class="hit-reason">${escapeHtml(matchReason)}</div></div>${score === null ? '' : `<div class="score-label"><span>${scoreTitle}</span><strong>${score.toFixed(3)}</strong></div><div class="score-track"><i style="width:${Math.max(0, Math.min(100, score * 100))}%"></i></div>`}<div class="metadata"><span>文件名称</span><strong title="${escapeHtml(asset.name)}">${escapeHtml(asset.name)}</strong><span>拍摄时间</span><strong>${escapeHtml(formatDate(asset.date))}</strong><span>分辨率</span><strong>${asset.width && asset.height ? `${asset.width} × ${asset.height}` : '未知'}</strong><span>来源</span><strong>${escapeHtml(sourceName(asset.source))}</strong><span>审核状态</span><strong>${asset.queued ? '待删除' : asset.reviewed === 'kept' ? '已保留' : asset.reviewed === 'later' ? '稍后复核' : '待复核'}</strong></div><div class="inspector-actions"><button class="keep-btn" id="keepOne">✓　保留</button><button class="later-btn" id="laterOne">稍后复核</button></div><button class="similar-action" id="findSimilar">⌕　查找相似照片</button>`;
+  $('#viewOriginal').onclick = () => openOriginalViewer(asset);
   $('#keepOne').onclick = () => review([asset], 'keep');
   $('#laterOne').onclick = () => review([asset], asset.reviewed === 'later' ? 'pending' : 'later');
   $('#findSimilar').onclick = () => findSimilarPhotos(asset);
 }
 
+async function openOriginalViewer(asset) {
+  const request = ++state.originalRequest;
+  $('#originalTitle').textContent = `${asset.name} · ${formatDate(asset.date)}`;
+  $('#originalView').innerHTML = '<span class="original-loading">正在读取高清原图…</span>';
+  $('#originalModal').classList.add('open');
+  try {
+    const dataUrl = await invoke('load_original_image', { id: asset.id, source: asset.source });
+    if (request !== state.originalRequest || !$('#originalModal').classList.contains('open')) return;
+    if (!dataUrl) throw new Error('没有读取到原图');
+    const image = new Image();
+    image.alt = asset.name;
+    image.src = dataUrl;
+    $('#originalView').replaceChildren(image);
+  } catch (error) {
+    if (request !== state.originalRequest) return;
+    $('#originalView').innerHTML = `<span class="original-loading">读取原图失败：${escapeHtml(error?.toString?.() || error)}</span>`;
+  }
+}
+
+function closeOriginalViewer() {
+  state.originalRequest++;
+  $('#originalModal').classList.remove('open');
+  $('#originalView').replaceChildren();
+}
+
+function defaultIndexDates() {
+  const today = new Date();
+  const start = new Date(today);
+  start.setDate(start.getDate() - 30);
+  const toInputDate = date => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  $('#indexStartDate').value = toInputDate(start);
+  $('#indexEndDate').value = toInputDate(today);
+  $('#indexSource').value = state.source;
+}
+
+function showIndexProgress(progress) {
+  const panel = $('#indexProgress');
+  panel.classList.add('show');
+  $('#indexProgressText').textContent = progress.message || '正在准备索引…';
+  const percent = progress.total ? Math.min(100, Math.round(progress.completed / progress.total * 100)) : progress.stage === 'done' ? 100 : 0;
+  $('#indexProgressFill').style.width = `${percent}%`;
+  $('#stopIndexBtn').disabled = !progress.running;
+  $('#startIndexBtn').disabled = Boolean(progress.running);
+}
+
+async function pollIndexProgress(request) {
+  if (request !== state.indexRequest) return;
+  try {
+    const progress = await invoke('index_progress');
+    showIndexProgress(progress);
+    if (!progress.running) {
+      clearInterval(state.indexTimer);
+      state.indexTimer = null;
+      if (progress.stage === 'done' || progress.stage === 'done_with_errors') {
+        await reloadCounts();
+        if (progress.stage === 'done_with_errors') toast(`原图索引完成，有 ${progress.failed} 张照片未能建立索引`);
+        else toast('原图向量索引已完成');
+      } else if (progress.stage === 'cancelled') toast('原图索引已停止');
+      return;
+    }
+  } catch (error) {
+    $('#indexProgressText').textContent = `读取索引进度失败：${error}`;
+  }
+}
+
+function startIndexing() {
+  const startDate = $('#indexStartDate').value;
+  const endDate = $('#indexEndDate').value;
+  if (!startDate || !endDate || startDate > endDate) { toast('请选择有效的索引开始和结束日期'); return; }
+  const request = ++state.indexRequest;
+  const startLocal = new Date(`${startDate}T00:00:00`);
+  const endLocal = new Date(`${endDate}T00:00:00`);
+  endLocal.setDate(endLocal.getDate() + 1);
+  const utcBoundary = date => date.toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const input = {
+    startDate, endDate, startAt: utcBoundary(startLocal), endBefore: utcBoundary(endLocal),
+    source: $('#indexSource').value,
+  };
+  $('#startIndexBtn').disabled = true;
+  $('#stopIndexBtn').disabled = true;
+  $('#indexProgress').classList.add('show');
+  $('#indexProgressText').textContent = '正在准备原图索引…';
+  $('#indexProgressFill').style.width = '0%';
+  clearInterval(state.indexTimer);
+  state.indexTimer = setInterval(() => pollIndexProgress(request), 600);
+  void invoke('start_indexing', { input }).then(async result => {
+    if (request !== state.indexRequest) return;
+    await pollIndexProgress(request);
+    if (result?.failed > 0) toast(`索引完成，${result.failed} 张照片读取或向量生成失败`);
+  }).catch(error => {
+    if (request !== state.indexRequest) return;
+    clearInterval(state.indexTimer); state.indexTimer = null;
+    $('#startIndexBtn').disabled = false;
+    $('#stopIndexBtn').disabled = true;
+    $('#indexProgressText').textContent = `索引启动失败：${error}`;
+    toast(`原图索引失败：${error}`);
+  });
+}
+
 async function findSimilarPhotos(asset) {
+  cancelSearchInput();
   try {
     const rows = await invoke('similar_photos', {
       id: asset.id, anchorSource: asset.source, source: state.source, limit: 120,
@@ -434,6 +544,7 @@ function updateRuleNav() {
   const container = $('#rulesList');
   container.innerHTML = state.rules.map((rule, index) => `<button class="nav-item rule-nav ${index ? '' : ''}" data-rule="${escapeHtml(rule.id)}"><span class="rule-dot ${['','mauve','olive','blue'][index % 4]}"></span><span class="rule-name">${escapeHtml(rule.name)}</span><span class="nav-count">${rule.candidates || 0}</span></button>`).join('');
   for (const button of container.querySelectorAll('.rule-nav')) button.onclick = () => {
+    cancelSearchInput();
     state.ruleId = button.dataset.rule; state.page = 'cleanup'; state.tab = 'all'; state.offset = 0; state.selected.clear();
     document.querySelectorAll('.rule-nav').forEach(item => item.classList.toggle('active-rule', item === button));
     renderGrid(); reloadCurrent();
@@ -686,24 +797,31 @@ async function confirmDelete() {
   finally { $('#confirmDelete').disabled = false; $('#confirmDelete').textContent = '确认删除'; }
 }
 
-let searchDebounce;
 async function searchPhotos(query) {
+  query = query.trim();
+  if (query !== state.query) state.includeWeak = false;
   const generation = ++state.searchGeneration;
+  state.searchPending = false; state.searchError = '';
   if (!query.trim()) {
     state.page = 'search'; state.query = ''; state.similarAnchor = null; state.offset = 0;
     state.total = 0; state.assets = []; state.selected.clear(); state.focus = null; renderGrid(); return;
   }
   state.similarAnchor = null;
   state.query = query; state.page = 'search'; state.tab = 'all'; state.offset = 0; state.assets = [];
-  state.total = 0; state.selected.clear(); state.focus = null; renderGrid();
+  state.total = 0; state.selected.clear(); state.focus = null;
+  state.searchPending = true; renderGrid();
   try {
-    const rows = await invoke('semantic_search', { input: { query, limit: 120, source: state.source } });
+    const rows = await invoke('semantic_search', { input: { query, limit: 120, source: state.source, includeWeak: state.includeWeak } });
     if (generation !== state.searchGeneration || state.page !== 'search' || state.query !== query) return;
+    state.searchPending = false;
     state.assets = rows.map(row => ({ ...row, id: row.id, date: row.date, media_type: 'image' }));
     state.total = state.assets.length;
     loadPhotoThumbs(state.assets); renderGrid();
   } catch (error) {
-    if (generation === state.searchGeneration) { toast(`语义搜索暂不可用：${error}`); renderGrid(); }
+    if (generation === state.searchGeneration) {
+      state.searchPending = false; state.searchError = String(error);
+      toast(`语义搜索暂不可用：${error}`); renderGrid();
+    }
   }
 }
 
@@ -717,7 +835,7 @@ async function refreshCurrentView() {
 }
 
 document.querySelectorAll('.nav-item[data-page]').forEach(button => button.addEventListener('click', async () => {
-  state.searchGeneration++;
+  cancelSearchInput();
   state.page = button.dataset.page; state.tab = 'all'; state.query = ''; resetLibraryOffsets(); state.selected.clear(); $('#search').value = '';
   if (state.page !== 'similar') state.similarAnchor = null;
   renderGrid(); await reloadCurrent();
@@ -731,11 +849,24 @@ document.querySelectorAll('.tab').forEach(button => button.addEventListener('cli
     await reloadCurrent();
   } else renderGrid();
 }));
-document.querySelectorAll('.rule-nav').forEach(button => button.addEventListener('click', () => { state.ruleId = button.dataset.rule; state.page = 'cleanup'; state.tab = 'all'; reloadCurrent(); }));
+document.querySelectorAll('.rule-nav').forEach(button => button.addEventListener('click', () => { cancelSearchInput(); state.ruleId = button.dataset.rule; state.page = 'cleanup'; state.tab = 'all'; reloadCurrent(); }));
 $('#sourceSelect').addEventListener('change', async event => { state.searchGeneration++; state.source = event.target.value; resetLibraryOffsets(); state.assets = []; state.selected.clear(); updateHeader(); await syncAll(); await refreshCurrentView(); });
-$('#search').addEventListener('input', event => { clearTimeout(searchDebounce); searchDebounce = setTimeout(() => searchPhotos(event.target.value), 450); });
+const cancelSearchInput = bindSearchInput($('#search'), searchPhotos, () => state.searchGeneration++);
+$('#weakResults').addEventListener('click', () => {
+  cancelSearchInput();
+  state.includeWeak = !state.includeWeak;
+  searchPhotos($('#search').value);
+});
 $('#scanBtn').addEventListener('click', () => runScan());
 $('#refreshBtn').addEventListener('click', () => runScan());
+$('#startIndexBtn').addEventListener('click', startIndexing);
+$('#stopIndexBtn').addEventListener('click', async () => {
+  $('#stopIndexBtn').disabled = true;
+  try { await invoke('stop_indexing'); }
+  catch (error) { $('#stopIndexBtn').disabled = false; toast(`停止索引失败：${error}`); }
+});
+$('#closeOriginal').addEventListener('click', closeOriginalViewer);
+$('#originalModal').addEventListener('click', event => { if (event.target === $('#originalModal')) closeOriginalViewer(); });
 $('#rulesBtn').addEventListener('click', () => openRuleModal(currentRule()));
 $('#addRule').addEventListener('click', () => openRuleModal());
 $('#saveRule').addEventListener('click', saveRule);
@@ -743,7 +874,7 @@ $('#cancelRule').addEventListener('click', closeRuleModal);
 $('#ruleThreshold').addEventListener('input', event => { $('#thresholdValue').textContent = Number(event.target.value).toFixed(2); });
 $('#addSelected').addEventListener('click', addToQueue);
 $('#confirmSelected').addEventListener('click', openDeleteConfirm);
-$('#viewQueue').addEventListener('click', async () => { state.page = 'queue'; state.tab = 'all'; state.selected.clear(); renderGrid(); await reloadCurrent(); });
+$('#viewQueue').addEventListener('click', async () => { cancelSearchInput(); state.page = 'queue'; state.tab = 'all'; state.selected.clear(); renderGrid(); await reloadCurrent(); });
 $('#confirmDelete').addEventListener('click', confirmDelete);
 $('#cancelDelete').addEventListener('click', () => $('#deleteModal').classList.remove('open'));
 $('#closeInspector').addEventListener('click', () => { state.inspectorHidden = true; renderGrid(); });
@@ -807,13 +938,27 @@ $('#photoGrid').addEventListener('keydown', event => {
 document.addEventListener('keydown', event => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); $('#search').focus(); }
   if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') { event.preventDefault(); runScan(); }
-  if (event.key === 'Escape') document.querySelectorAll('.modal-backdrop.open').forEach(node => node.classList.remove('open'));
+  if (event.key === 'Escape') {
+    if ($('#originalModal').classList.contains('open')) closeOriginalViewer();
+    else document.querySelectorAll('.modal-backdrop.open').forEach(node => node.classList.remove('open'));
+  }
   if (event.key === ' ' && !['INPUT','TEXTAREA','BUTTON'].includes(document.activeElement.tagName) && state.focus) { event.preventDefault(); state.selected.has(state.focus) ? state.selected.delete(state.focus) : state.selected.add(state.focus); renderGrid(); }
 });
 for (const modal of document.querySelectorAll('.modal-backdrop')) modal.addEventListener('click', event => { if (event.target === modal) modal.classList.remove('open'); });
 
 await syncAll();
 await reloadCurrent();
+defaultIndexDates();
+try {
+  const initialIndexProgress = await invoke('index_progress');
+  if (initialIndexProgress.running || ['done', 'done_with_errors', 'cancelled', 'error'].includes(initialIndexProgress.stage)) {
+    showIndexProgress(initialIndexProgress);
+    if (initialIndexProgress.running) {
+      const request = ++state.indexRequest;
+      state.indexTimer = setInterval(() => pollIndexProgress(request), 700);
+    }
+  }
+} catch { /* 索引进度命令可能尚未就绪。 */ }
 setInterval(async () => {
   let refresh = false;
   try {
@@ -839,4 +984,14 @@ setInterval(async () => {
     const progress = await invoke('scan_progress');
     if (progress.running && !state.scanTimer) $('#progressText').textContent = progress.message;
   } catch { /* 初始 Rust 状态仍在加载时忽略。 */ }
+  if (!state.indexTimer) {
+    try {
+      const progress = await invoke('index_progress');
+      if (progress.running) {
+        showIndexProgress(progress);
+        const request = ++state.indexRequest;
+        state.indexTimer = setInterval(() => pollIndexProgress(request), 700);
+      }
+    } catch { /* 初始 Rust 状态仍在加载时忽略。 */ }
+  }
 }, 18000);
