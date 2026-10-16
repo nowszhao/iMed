@@ -937,6 +937,22 @@ async fn usb_status() -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn open_photos_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        return std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Photos")
+            .status()
+            .map(|_| ())
+            .map_err(|e| format!("无法打开系统设置：{e}"));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("当前平台不支持打开系统设置".into())
+    }
+}
+
+#[tauri::command]
 async fn list_assets(state: State<'_, AppState>, args: ListArgs) -> Result<Value, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -1521,6 +1537,7 @@ fn main() {
             bootstrap,
             photos_status,
             photos_authorize,
+            open_photos_settings,
             usb_status,
             list_assets,
             list_rules,

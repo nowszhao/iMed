@@ -55,12 +55,13 @@ function renderSetup() {
   $('#setupNext').textContent = step === 0 ? (state.modelState === 'ready' ? '继续' : state.modelState === 'error' ? '重试准备' : '准备模型') : step === 1 ? '继续' : '建立索引';
   $('#setupStopIndex').classList.toggle('is-hidden', !state.setupIndexRun || !state.indexProgress?.running);
   const chosenSources = setupChosenSources();
-  $('#setupNext').disabled = step === 0
-    ? ['checking','loading','downloading','warming'].includes(state.modelState)
-    : step === 1
-      ? !chosenSources.length || chosenSources.some(source => !state.setupSyncedSources.has(source))
-      : false;
-  $('#setupNext').classList.toggle('is-hidden', step === 1);
+  const syncedSources = chosenSources.filter(source => state.setupSyncedSources.has(source));
+  // 来源步骤的“继续”保持可用：未同步时给出提示，已同步任意一个来源即可进入索引步骤。
+  $('#setupNext').disabled = step === 0 && ['checking','loading','downloading','warming'].includes(state.modelState);
+  $('#setupNext').classList.toggle('is-hidden', false);
+  if (step === 1 && syncedSources.length && syncedSources.length < chosenSources.length) {
+    $('#setupSyncStatus').textContent = `已同步 ${syncedSources.map(sourceLabel).join(' · ')}，其余来源可稍后在首页同步。`;
+  }
 }
 
 async function pollModelSetup() {
@@ -151,12 +152,17 @@ function setupNext() {
   }
   if (state.setupStep === 1) {
     const sources = setupChosenSources();
-    if (!sources.length || sources.some(source => !state.setupSyncedSources.has(source))) {
-      $('#setupSyncStatus').textContent = '请先授权并同步至少一个照片来源。';
+    const synced = sources.filter(source => state.setupSyncedSources.has(source));
+    if (!synced.length) {
+      $('#setupSyncStatus').textContent = sources.length
+        ? '请先点“同步所选来源”同步至少一个来源；也可以点“稍后设置”先进入首页。'
+        : '请至少选择一个照片来源，或点“稍后设置”先进入首页。';
       return;
     }
     state.setupStep = 2;
-    setupStatus('照片来源已同步，可以选择索引范围。');
+    setupStatus(synced.length === sources.length
+      ? '照片来源同步完成，可以选择索引范围。'
+      : `已同步 ${synced.map(sourceLabel).join(' · ')}，可以选择索引范围；其余来源可稍后在首页同步。`);
     renderSetup();
     return;
   }
@@ -184,12 +190,6 @@ function setupChosenIndexSource() {
   return $('#setupIndexSource').value || 'all';
 }
 
-function setupChosenSource() {
-  const chosen = setupChosenSources();
-  if (chosen.includes('photos') && chosen.includes('usb')) return 'all';
-  return chosen[0] || '';
-}
-
 function updateSetupIndexSources() {
   const selected = [...state.setupSyncedSources];
   const select = $('#setupIndexSource');
@@ -205,13 +205,13 @@ function updateSetupIndexSources() {
 
 async function syncSetupSources() {
   const sources = setupChosenSources();
-  const source = setupChosenSource();
   if (!sources.length) { $('#setupSyncStatus').textContent = '请至少选择一个照片来源。'; return; }
   state.setupSyncedSources.clear();
   document.querySelectorAll('#setupSourceChoices input').forEach(input => { input.disabled = true; });
   renderSetup();
   $('#setupSyncSources').disabled = true;
   $('#setupSyncStatus').textContent = '正在同步来源媒体信息…';
+  const failures = [];
   clearInterval(state.syncTimer);
   state.syncTimer = setInterval(async () => {
     try {
@@ -220,18 +220,31 @@ async function syncSetupSources() {
     } catch { /* 保留当前进度文案。 */ }
   }, 500);
   try {
-    const result = await invoke('library_sync', { source });
+    for (const item of sources) {
+      $('#setupSyncStatus').textContent = `正在同步${sourceLabel(item)}…`;
+      try {
+        const result = await invoke('library_sync', { source: item });
+        state.setupSyncedSources.add(item);
+        $('#setupSyncStatus').textContent = `${sourceLabel(item)} 已同步 ${result.synced || 0} 项媒体。`;
+      } catch (error) {
+        failures.push(`${sourceLabel(item)}：${syncErrorText(error)}`);
+        $('#setupSyncStatus').textContent = `${sourceLabel(item)} 同步失败：${syncErrorText(error)}`;
+      }
+    }
     await syncAll();
-    state.setupSyncedSources = new Set(sources);
     updateSetupIndexSources();
-    $('#setupSyncStatus').textContent = `同步完成，共 ${result.synced || 0} 项媒体。`;
+    const synced = sources.filter(item => state.setupSyncedSources.has(item));
+    if (!synced.length) {
+      $('#setupSyncStatus').textContent = `同步未完成：${failures.join('；')}。可重试，或点“稍后设置”先进入首页。`;
+      return;
+    }
     state.setupStep = 2;
-    state.source = source;
-    $('#sourceSelect').value = source;
-    setupStatus('照片来源同步完成，可以选择索引范围。');
+    state.source = $('#setupIndexSource').value || synced[0];
+    $('#sourceSelect').value = state.source;
+    setupStatus(failures.length
+      ? `已同步 ${synced.map(sourceLabel).join(' · ')}，可以选择索引范围。${failures.join('；')}，可稍后在首页重新同步。`
+      : `照片来源同步完成（${synced.map(sourceLabel).join(' · ')}），可以选择索引范围。`);
     renderSetup();
-  } catch (error) {
-    $('#setupSyncStatus').textContent = `同步未完成：${error}`;
   } finally {
     clearInterval(state.syncTimer); state.syncTimer = null;
     document.querySelectorAll('#setupSourceChoices input').forEach(input => { input.disabled = false; });
@@ -241,6 +254,13 @@ async function syncSetupSources() {
 
 async function authorizeSetupPhotos() {
   try {
+    const current = await invoke('photos_status');
+    state.photoStatus = current.status || state.photoStatus;
+    if (['denied', 'restricted'].includes(state.photoStatus)) {
+      await openSystemSettings();
+      $('#setupSyncStatus').textContent = '系统设置已打开：在“隐私与安全性 → 照片”中允许拾光访问，然后回到这里点“同步所选来源”。';
+      return;
+    }
     await invoke('photos_authorize');
     $('#setupSyncStatus').textContent = '已请求系统授权。请在 macOS 对话框中允许访问，再点击“同步所选来源”。';
     for (let attempt = 0; attempt < 60; attempt++) {
@@ -252,6 +272,22 @@ async function authorizeSetupPhotos() {
     updateHeader();
     renderSetup();
   } catch (error) { $('#setupSyncStatus').textContent = `授权状态读取失败：${error}`; }
+}
+
+function sourceLabel(source) {
+  return source === 'usb' ? 'USB iPhone' : 'Mac 照片图库';
+}
+
+function syncErrorText(error) {
+  const text = String(error || '同步失败');
+  if (/unlock/i.test(text)) return '请解锁 iPhone 后重试';
+  if (/trust/i.test(text)) return '请在 iPhone 上选择“信任此电脑”';
+  return text;
+}
+
+async function openSystemSettings() {
+  try { await invoke('open_photos_settings'); }
+  catch (error) { toast(`无法打开系统设置：${error}`); }
 }
 
 function escapeHtml(value = '') {
@@ -1193,6 +1229,7 @@ document.querySelectorAll('.nav-item[data-page]').forEach(button => button.addEv
 $('#setupNext').addEventListener('click', setupNext);
 $('#setupBack').addEventListener('click', setupBack);
 $('#setupSkip').addEventListener('click', finishSetup);
+$('#setupLater').addEventListener('click', finishSetup);
 $('#setupAuthorizePhotos').addEventListener('click', authorizeSetupPhotos);
 $('#setupSyncSources').addEventListener('click', syncSetupSources);
 $('#setupSourceChoices').querySelectorAll('input').forEach(input => input.addEventListener('change', renderSetup));
@@ -1262,6 +1299,7 @@ $('#closeInspector').addEventListener('click', () => { state.inspectorHidden = t
 $('#showInspector').addEventListener('click', () => { state.inspectorHidden = false; renderGrid(); });
 $('#sourceHelp').addEventListener('click', () => $('#sourceModal').classList.add('open'));
 $('#closeSource').addEventListener('click', () => $('#sourceModal').classList.remove('open'));
+$('#openSettings').addEventListener('click', openSystemSettings);
 $('#refreshSources').addEventListener('click', async () => {
   const button = $('#refreshSources');
   button.disabled = true;
@@ -1284,6 +1322,9 @@ $('#refreshSources').addEventListener('click', async () => {
     } catch (error) {
       toast(`读取照片图库授权状态失败：${error}`);
     }
+  } else if (['denied', 'restricted'].includes(state.photoStatus)) {
+    await openSystemSettings();
+    updateSourceDialog();
   } else {
     await syncAll();
     await refreshCurrentView();
