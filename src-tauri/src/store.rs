@@ -4,8 +4,12 @@ use serde_json::{Value, json};
 
 const EMBEDDER_VERSION: &str = "embeddinggemma-2:440m:768:original-image-v3";
 const THUMBNAIL_CACHE_BUDGET_BYTES: i64 = 128 * 1024 * 1024;
-const SEARCH_Z_GATE: f64 = 2.0;
+const SEARCH_Z_GATE: f64 = 1.5;
 const SEARCH_DEVIATION_FLOOR: f64 = 0.02;
+/// Calibration for EmbeddingGemma 2: its scores sit in a narrow band, so a
+/// query whose best candidate stays below this level has no real match at all
+/// (measured: related queries 0.70-0.75, unrelated ones 0.60-0.63).
+const SEARCH_MIN_TOP_SCORE: f64 = 0.66;
 
 pub fn initialize(db: &Connection) -> rusqlite::Result<()> {
     db.execute_batch(
@@ -501,6 +505,11 @@ pub fn semantic_search(
         .sum::<f64>()
         / count;
     let deviation = variance.sqrt().max(SEARCH_DEVIATION_FLOOR);
+    let best = found.iter().map(|(score, _, _)| *score).fold(f32::MIN, f32::max);
+    let has_exact = found.iter().any(|(_, exact, _)| *exact);
+    if !include_weak && !has_exact && (best as f64) < SEARCH_MIN_TOP_SCORE {
+        found.clear();
+    }
     for (score, exact_name, row) in &mut found {
         let relevance = (*score as f64 - mean) / deviation;
         row["weakMatch"] = json!(!*exact_name && (*score <= 0.0 || relevance < SEARCH_Z_GATE));
@@ -885,6 +894,146 @@ pub fn mark_deleted(db: &Connection, ids: &[String]) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// End-to-end retrieval check against real photos on this machine.
+    ///
+    /// ```text
+    /// SHIGUANG_LOCAL_EVAL=/tmp/sg_local/manifest.json \
+    ///   cargo test --release -- --ignored local_library_retrieval --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn local_library_retrieval() {
+        let Ok(manifest_path) = std::env::var("SHIGUANG_LOCAL_EVAL") else {
+            eprintln!("set SHIGUANG_LOCAL_EVAL to a manifest json");
+            return;
+        };
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
+        let model_dir = std::env::var("SHIGUANG_MODEL_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                    .join("Library/Application Support/com.shiguang.photo-organizer/models")
+            });
+        unsafe {
+            std::env::set_var("HF_HOME", &model_dir);
+            std::env::set_var("HF_ENDPOINT", "https://hf-mirror.com");
+        }
+        let source = embeddinggemma_core::resolve_source("440m", &model_dir);
+        let files = embeddinggemma_core::ModelFiles::locate(&source).unwrap();
+        let model = embeddinggemma_core::Embedder::load_files(
+            &files,
+            &source,
+            "embeddinggemma-2".into(),
+            embeddinggemma_core::EmbedderOptions {
+                device: embeddinggemma_core::DeviceRequest::Auto,
+                modalities: Some(embeddinggemma_core::Modalities { image: true, audio: false }),
+                image_soft_tokens: Some(140),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        model.warmup().unwrap();
+
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let mut names = std::collections::HashMap::new();
+        for photo in manifest["photos"].as_array().unwrap() {
+            let path = photo["path"].as_str().unwrap();
+            let bytes = std::fs::read(path).unwrap();
+            let vector = model
+                .embed_contents(&embeddinggemma_core::ContentEmbeddingsRequest {
+                    input: embeddinggemma_core::OneOrMany::One(
+                        embeddinggemma_core::Content::Image { data: bytes.into(), format: None },
+                    ),
+                    ..Default::default()
+                })
+                .unwrap()
+                .output
+                .remove(0);
+            let name = photo["name"].as_str().unwrap().to_string();
+            let asset = Asset {
+                id: name.clone(),
+                source: photo["source"].as_str().unwrap().to_string(),
+                name: name.clone(),
+                date: photo["date"].as_str().unwrap_or("").to_string(),
+                width: photo["width"].as_i64().unwrap_or(0) as i32,
+                height: photo["height"].as_i64().unwrap_or(0) as i32,
+                favorite: false,
+                media_type: "image".into(),
+                thumbnail: None,
+                score: None,
+                reviewed: "pending".into(),
+                queued: false,
+                rule_id: None,
+                index_status: "pending".into(),
+            };
+            save_embedding(&db, &asset, &vector).unwrap();
+            names.insert(name, photo["original_name"].as_str().unwrap_or("").to_string());
+        }
+
+        let mut failures = Vec::new();
+        for case in manifest["cases"].as_array().unwrap() {
+            let query = case["query"].as_str().unwrap();
+            let expect: Vec<&str> = case["expect"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+            let vector = model
+                .embed_request(&embeddinggemma_core::EmbeddingsRequest {
+                    input: query.to_string().into(),
+                    task: Some(embeddinggemma_core::EmbeddingTask::Query),
+                    ..Default::default()
+                })
+                .unwrap()
+                .output
+                .remove(0);
+            let results = semantic_search(&db, &vector, query, 12, "all", false).unwrap();
+            let mut all_scores: Vec<(String, f64)> = db
+                .prepare("SELECT a.name,e.vector FROM embeddings e JOIN assets a USING(asset_key)")
+                .unwrap()
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))
+                .unwrap()
+                .map(|row| {
+                    let (name, bytes) = row.unwrap();
+                    let candidate: Vec<f32> = bytes
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect();
+                    (name, super::super::cosine(&vector, &candidate) as f64)
+                })
+                .collect();
+            all_scores.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let n = all_scores.len().max(1) as f64;
+            let mean = all_scores.iter().map(|s| s.1).sum::<f64>() / n;
+            let std = (all_scores.iter().map(|s| (s.1 - mean).powi(2)).sum::<f64>() / n).sqrt().max(SEARCH_DEVIATION_FLOOR);
+            let top_z = (all_scores[0].1 - mean) / std;
+            println!("  distribution mean {mean:.3} std {std:.3} top-z {top_z:+.2}");
+            let top: Vec<String> = results
+                .iter()
+                .take(5)
+                .map(|r| format!("{} ({:.3})", r["name"].as_str().unwrap_or("?"), r["score"].as_f64().unwrap_or(0.0)))
+                .collect();
+            let rank = results
+                .iter()
+                .position(|r| expect.contains(&r["name"].as_str().unwrap_or("")))
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            println!("{query:<28} expected {expect:?} -> rank {rank}; top {top:?}");
+            if expect.is_empty() {
+                assert!(results.is_empty(), "{query}: expected no strong match, got {top:?}");
+                continue;
+            }
+            if rank == 0 || rank > 3 {
+                let weak = semantic_search(&db, &vector, query, 8, "all", true).unwrap();
+                let weak_top: Vec<String> = weak
+                    .iter()
+                    .map(|r| format!("{} ({:.3})", r["name"].as_str().unwrap_or("?"), r["score"].as_f64().unwrap_or(0.0)))
+                    .collect();
+                println!("  weak-only ranking: {weak_top:?}");
+                failures.push(query.to_string());
+            }
+        }
+        assert!(failures.is_empty(), "queries without a relevant result: {failures:?}");
+    }
 
     fn test_asset(source: &str, id: &str, media_type: &str) -> Asset {
         Asset {

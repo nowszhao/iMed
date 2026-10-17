@@ -36,6 +36,12 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na.sqrt() * nb.sqrt()) }
 }
 
+fn base64_decode_thumbnail(value: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use base64::Engine;
+    let raw = value.split_once(',').map(|(_, body)| body).unwrap_or(value);
+    Ok(base64::engine::general_purpose::STANDARD.decode(raw)?)
+}
+
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
@@ -168,6 +174,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?
         .collect::<Result<_, _>>()?;
     println!("version {version}: {} vectors", photos.len());
+
+    if std::env::var("SHIGUANG_SEED").is_ok() {
+        // Backfill embeddings from the thumbnails already cached in the app DB,
+        // so search works while the phone is disconnected. Original-quality
+        // indexing replaces these rows for the same asset later.
+        let db = Connection::open(database_path())?;
+        let rows: Vec<(String, String, String)> = db
+            .prepare(
+                "SELECT a.asset_key,a.name,a.thumbnail FROM assets a
+                 WHERE a.thumbnail IS NOT NULL AND a.deleted_at IS NULL AND a.media_type='image'
+                   AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.asset_key=a.asset_key AND e.model_version=?)",
+            )?
+            .query_map(params![version], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut written = 0usize;
+        for (key, name, thumbnail) in rows {
+            let raw = base64_decode_thumbnail(&thumbnail);
+            let Ok(bytes) = raw else { continue };
+            let vector = model
+                .embed_contents(&ContentEmbeddingsRequest {
+                    input: OneOrMany::One(Content::Image { data: bytes.into(), format: None }),
+                    ..Default::default()
+                })?
+                .output
+                .remove(0);
+            let blob: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
+            db.execute(
+                "INSERT INTO embeddings(asset_key,model_version,dimensions,vector) VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(asset_key,model_version) DO UPDATE SET dimensions=excluded.dimensions,vector=excluded.vector",
+                params![key, version, vector.len() as i64, blob],
+            )?;
+            written += 1;
+            println!("  seeded {name}");
+        }
+        println!("seeded {written} thumbnails");
+        return Ok(());
+    }
 
     if let Ok(path) = std::env::var("SHIGUANG_DUMP") {
         let mut out = String::from("{");
