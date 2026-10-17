@@ -2,7 +2,7 @@ use super::{Asset, ReviewInput, Rule, RuleInput};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
-const EMBEDDER_VERSION: &str = "embeddinggemma-2:440m:768:original-image-v2";
+const EMBEDDER_VERSION: &str = "embeddinggemma-2:440m:768:original-image-v3";
 const THUMBNAIL_CACHE_BUDGET_BYTES: i64 = 128 * 1024 * 1024;
 const SEARCH_Z_GATE: f64 = 2.0;
 const SEARCH_DEVIATION_FLOOR: f64 = 0.02;

@@ -1056,7 +1056,6 @@ checksum = "4ef6b89e5b37196644d8796de5268852ff179b44e96276cf4290264843743bb7"
 [[package]]
 name = "embeddinggemma_core"
 version = "0.1.0"
-source = "git+https://github.com/ikcore/ai-embeddinggemma-2?rev=2369ca8eeebee30785b7a6eff1ab7968e5a56404#2369ca8eeebee30785b7a6eff1ab7968e5a56404"
 dependencies = [
  "base64 0.22.1",
  "candle-core",

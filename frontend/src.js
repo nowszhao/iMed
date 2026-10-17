@@ -399,9 +399,11 @@ function setSubheading() {
   } else if (state.page === 'indexing') {
     $('#subheading').innerHTML = '选择日期范围，为照片建立本地向量索引。';
   } else if (state.page === 'search') {
+    const indexed = state.source === 'usb' ? (state.counts.indexedUsb || 0)
+      : state.source === 'photos' ? (state.counts.indexedPhotos || 0) : (state.counts.indexed || 0);
     $('#subheading').innerHTML = state.query
-      ? `搜索 <strong>“${escapeHtml(state.query)}”</strong> 的已索引照片 · ${state.includeWeak ? '包含较弱相关结果' : '仅显示相关性突出的结果'}`
-      : '输入场景或画面描述，在已索引照片中搜索';
+      ? `搜索 <strong>“${escapeHtml(state.query)}”</strong> · 在已建立索引的 <strong>${indexed}</strong> 张照片中检索${state.includeWeak ? ' · 包含较弱相关结果' : ''}`
+      : `输入场景或画面描述；当前已建立索引 <strong>${indexed}</strong> 张照片`;
   } else {
     $('#subheading').innerHTML = `<strong>${state.total || 0} 张</strong>照片`;
   }
